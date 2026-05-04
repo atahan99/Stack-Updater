@@ -73,6 +73,8 @@ CUP_URL=""
 # POST/GET /api/v3/refresh before JSON when true; timeout seconds for refresh + JSON curl.
 CUP_REFRESH_BEFORE_CHECK="${CUP_REFRESH_BEFORE_CHECK:-true}"
 CUP_REFRESH_TIMEOUT_SECONDS="${CUP_REFRESH_TIMEOUT_SECONDS:-60}"
+# After stack redeploys, POST /api/v3/refresh so Cup UI/next run see new state (does not alter this run's summary).
+CUP_REFRESH_AFTER_STACKS="${CUP_REFRESH_AFTER_STACKS:-true}"
 
 SKIP_STACK_PHASE_IF_CUP_CLEAN="false"
 SKIP_CLEANUP_IF_STACKS_SKIPPED="true"
@@ -184,8 +186,23 @@ LAST_CUP_UNKNOWN=""
 CUP_STATUS="not_checked"
 CUP_LAST_ERROR=""
 CUP_JSON_SNAPSHOT=""
-# True after first cup_refresh_if_enabled attempt in this run (refresh only before first JSON fetch).
+# True after first pre-run Cup refresh+JSON path in this run (only cup_fetch_json arms refresh once).
 CUP_REFRESH_DONE="false"
+# Immutable Cup counts/json from the first successful parse this run (Run Summary / pipeline_end).
+CUP_RUN_METRICS_LOCKED="false"
+CUP_RUN_TRACKED=""
+CUP_RUN_OUTDATED=""
+CUP_RUN_CURRENT=""
+CUP_RUN_UNKNOWN=""
+CUP_RUN_JSON_SNAPSHOT=""
+# Optional diagnostics after post-stack refresh only (never used for summary or redeploy decisions).
+CUP_POST_TRACKED=""
+CUP_POST_OUTDATED=""
+CUP_POST_CURRENT=""
+CUP_POST_UNKNOWN=""
+CUP_POST_REFRESH_JSON=""
+# Last HTTP code from cup_http_refresh_once (logging).
+CUP_HTTP_REFRESH_LAST_CODE=""
 # Set when quiet stack rows / subgroup block finished; blank line before CLEANUP banner.
 QUIET_STACK_SECTION_DONE="false"
 # Cleanup phase one-line summaries (set by cleanup_docker).
@@ -215,6 +232,18 @@ reset_full_pipeline_summaries() {
   CUP_LAST_ERROR=""
   CUP_JSON_SNAPSHOT=""
   CUP_REFRESH_DONE="false"
+  CUP_RUN_METRICS_LOCKED="false"
+  CUP_RUN_TRACKED=""
+  CUP_RUN_OUTDATED=""
+  CUP_RUN_CURRENT=""
+  CUP_RUN_UNKNOWN=""
+  CUP_RUN_JSON_SNAPSHOT=""
+  CUP_POST_TRACKED=""
+  CUP_POST_OUTDATED=""
+  CUP_POST_CURRENT=""
+  CUP_POST_UNKNOWN=""
+  CUP_POST_REFRESH_JSON=""
+  CUP_HTTP_REFRESH_LAST_CODE=""
   QUIET_STACK_SECTION_DONE="false"
   CLEANUP_IMAGE_SUMMARY=""
   CLEANUP_NETWORK_SUMMARY=""
@@ -496,6 +525,12 @@ esac
 CUP_REFRESH_TIMEOUT_SECONDS="${CUP_REFRESH_TIMEOUT_SECONDS:-60}"
 CUP_REFRESH_TIMEOUT_SECONDS="${CUP_REFRESH_TIMEOUT_SECONDS//[^0-9]/}"
 [[ -z "$CUP_REFRESH_TIMEOUT_SECONDS" ]] && CUP_REFRESH_TIMEOUT_SECONDS=60
+
+case "${CUP_REFRESH_AFTER_STACKS,,}" in
+  1 | true | yes) CUP_REFRESH_AFTER_STACKS="true" ;;
+  0 | false | no) CUP_REFRESH_AFTER_STACKS="false" ;;
+  *) CUP_REFRESH_AFTER_STACKS="true" ;;
+esac
 
 case "${PORTAINER_USE_CUP_PRECHECK,,}" in
   1 | true | yes) PORTAINER_USE_CUP_PRECHECK="true" ;;
@@ -1766,6 +1801,7 @@ init_selective_context() {
     else
       SELECTIVE_CUP_JSON="$(cup_fetch_json 2>/dev/null || true)"
     fi
+    [[ -n "$SELECTIVE_CUP_JSON" ]] && cup_lock_snapshot_from_json_if_unlocked "$SELECTIVE_CUP_JSON" || true
     if [[ -z "$SELECTIVE_CUP_JSON" ]]; then
       if [[ "${CUP_STATUS:-}" != "ok" ]]; then
         log_warn "Selective mode: Cup JSON unavailable; all stacks treated as redeploy candidates (safe)."
@@ -2228,17 +2264,112 @@ print_cup_stats_tty() {
   printf '  %s%s Unknown: %s%s\n' "$(tty_color dim)" "❔" "${unknown}" "$(tty_color reset)"
 }
 
-# Optional refresh before JSON (Cup /api/v3/refresh). Non-fatal on failure.
-cup_refresh_if_enabled() {
-  [[ "${CUP_REFRESH_BEFORE_CHECK:-true}" == "true" ]] || return 0
+# POST then GET /api/v3/refresh. Sets CUP_HTTP_REFRESH_LAST_CODE. Returns 0 if any attempt returns 2xx.
+cup_http_refresh_once() {
   local base sec code
   base="${CUP_URL%/}"
   sec="${CUP_REFRESH_TIMEOUT_SECONDS:-60}"
-  [[ -z "$base" ]] && return 0
+  CUP_HTTP_REFRESH_LAST_CODE=""
+  [[ -z "$base" ]] && return 1
   code="$(curl -sS --max-time "$sec" -o /dev/null -w "%{http_code}" -X POST "${base}/api/v3/refresh" 2>/dev/null || printf '%s' "000")"
+  CUP_HTTP_REFRESH_LAST_CODE="$code"
   [[ "$code" =~ ^2 ]] && return 0
   code="$(curl -sS --max-time "$sec" -o /dev/null -w "%{http_code}" "${base}/api/v3/refresh" 2>/dev/null || printf '%s' "000")"
+  CUP_HTTP_REFRESH_LAST_CODE="$code"
   [[ "$code" =~ ^2 ]] && return 0
+  return 1
+}
+
+# After refresh, poll GET /api/v3/json until cup_compute_counts succeeds or timeout (same seconds as CUP_REFRESH_TIMEOUT_SECONDS).
+cup_poll_json_until_metrics_ready() {
+  local label="${1:-poll}" sec0 now elapsed tracked _o _c _u json
+  sec0="$(date +%s 2>/dev/null || echo 0)"
+  while true; do
+    json="$(cup_fetch_json_document 2>/dev/null)" || json=""
+    if [[ -n "$json" ]]; then
+      read -r tracked _o _c _u <<<"$(cup_compute_counts_from_json "$json")"
+      if [[ "$tracked" != "-1" ]]; then
+        log_verbose "Cup (${label}): JSON metrics ready (tracked=${tracked})."
+        _emit_log_file_ts "Cup (${label}): JSON metrics ready (HTTP GET /api/v3/json, tracked=${tracked})."
+        return 0
+      fi
+    fi
+    now="$(date +%s 2>/dev/null || echo 0)"
+    elapsed=$((now - sec0))
+    [[ "$elapsed" -ge "${CUP_REFRESH_TIMEOUT_SECONDS:-60}" ]] && break
+    sleep 3
+  done
+  log_warn "Cup (${label}): timed out after ${CUP_REFRESH_TIMEOUT_SECONDS:-60}s waiting for parseable JSON metrics (${CUP_URL:-})."
+  _emit_log_file_ts "Cup (${label}): timed out waiting for parseable JSON metrics (${CUP_URL:-})."
+  return 1
+}
+
+# After stack redeploys: refresh Cup for next run / UI only (never mutates CUP_JSON_SNAPSHOT, LAST_CUP_*, or CUP_RUN_*).
+cup_refresh_after_stacks_if_configured() {
+  [[ "${CUP_ENABLED:-false}" == "true" ]] || return 0
+  [[ "${CUP_REFRESH_AFTER_STACKS:-true}" == "true" ]] || return 0
+  [[ "${#STACKS_REDEPLOYED[@]}" -gt 0 ]] || return 0
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log_verbose "Cup (post-stack): dry-run — would POST ${CUP_URL%/}/api/v3/refresh after ${#STACKS_REDEPLOYED[@]} redeploy(s)"
+    _emit_log_file_ts "Cup (post-stack): dry-run; would refresh after ${#STACKS_REDEPLOYED[@]} redeploy(s) (skipped)."
+    return 0
+  fi
+
+  local base json t o c u
+  base="${CUP_URL%/}"
+  log_verbose "Cup (post-stack): POST ${base}/api/v3/refresh after ${#STACKS_REDEPLOYED[@]} stack redeploy(s)"
+  _emit_log_file_ts "Cup (post-stack): requesting /api/v3/refresh at ${base} (${#STACKS_REDEPLOYED[@]} redeploy(s); diagnostic only, not used for this run summary)"
+
+  if _quiet_tree_tty; then
+    print_info 4 "$(_leg_icon in_progress) Refreshing Cup after stack updates…"
+  fi
+
+  CUP_POST_TRACKED=""
+  CUP_POST_OUTDATED=""
+  CUP_POST_CURRENT=""
+  CUP_POST_UNKNOWN=""
+  CUP_POST_REFRESH_JSON=""
+
+  if cup_http_refresh_once; then
+    _emit_log_file_ts "Cup (post-stack): /api/v3/refresh HTTP ${CUP_HTTP_REFRESH_LAST_CODE}; polling /api/v3/json (diagnostic)"
+    cup_poll_json_until_metrics_ready "post-stack" || true
+    json="$(cup_fetch_json_document 2>/dev/null)" || json=""
+    if [[ -n "$json" ]]; then
+      read -r t o c u <<<"$(cup_compute_counts_from_json "$json")"
+      if [[ "$t" != "-1" ]]; then
+        CUP_POST_TRACKED="$t"
+        CUP_POST_OUTDATED="$o"
+        CUP_POST_CURRENT="$c"
+        CUP_POST_UNKNOWN="$u"
+        CUP_POST_REFRESH_JSON="$(echo "$json" | jq -c '{metrics:(.metrics//null)}' 2>/dev/null || echo "{}")"
+        _emit_log_file_ts "Cup (post-stack): metrics after refresh — tracked=${t} updates_available=${o} up_to_date=${c} unknown=${u:-0}"
+        log_verbose "Cup (post-stack): metrics after refresh — tracked=${t} updates=${o} up_to_date=${c} unknown=${u:-0}"
+      fi
+    fi
+    if _quiet_tree_tty; then
+      print_info 4 "$(tty_checkmark) Cup refresh requested"
+    fi
+  else
+    log_warn "Cup (post-stack): /api/v3/refresh failed (${CUP_URL:-} HTTP ${CUP_HTTP_REFRESH_LAST_CODE:-000}); Cup UI may be stale until next scan."
+    _emit_log_file_ts "Cup (post-stack): /api/v3/refresh failed (HTTP ${CUP_HTTP_REFRESH_LAST_CODE:-000})"
+  fi
+  return 0
+}
+
+# Optional refresh before JSON (Cup /api/v3/refresh). Non-fatal on failure; used by cup_fetch_json.
+cup_refresh_if_enabled() {
+  [[ "${CUP_REFRESH_BEFORE_CHECK:-true}" == "true" ]] || return 0
+  local base="${CUP_URL%/}"
+  [[ -z "$base" ]] && return 0
+  _emit_log_file_ts "Cup (pre-run): requesting /api/v3/refresh at ${base} (curl max-time ${CUP_REFRESH_TIMEOUT_SECONDS:-60}s per attempt)"
+  log_verbose "Cup (pre-run): POST ${base}/api/v3/refresh (GET fallback if non-2xx)"
+  if cup_http_refresh_once; then
+    _emit_log_file_ts "Cup (pre-run): /api/v3/refresh HTTP ${CUP_HTTP_REFRESH_LAST_CODE}; polling /api/v3/json until metrics parseable (interval 3s, max ${CUP_REFRESH_TIMEOUT_SECONDS:-60}s)"
+    log_verbose "Cup (pre-run): refresh ok HTTP ${CUP_HTTP_REFRESH_LAST_CODE}; polling JSON for metrics"
+    cup_poll_json_until_metrics_ready "pre-run" || true
+    return 0
+  fi
   if [[ "${CUP_STATUS:-}" != "ok" ]]; then
     log_warn "Cup: /api/v3/refresh failed or timed out (${CUP_URL:-}); continuing with JSON fetch."
   else
@@ -2264,6 +2395,36 @@ cup_fetch_json() {
     CUP_REFRESH_DONE="true"
   fi
   cup_fetch_json_document
+}
+
+# First successful Cup JSON this run: populate LAST_*, CUP_JSON_SNAPSHOT, and CUP_RUN_* (idempotent if already locked).
+cup_lock_snapshot_from_json_if_unlocked() {
+  local json="$1" tracked outdated current cup_unknown
+  [[ "${CUP_ENABLED:-false}" == "true" ]] || return 0
+  [[ "${CUP_RUN_METRICS_LOCKED:-false}" == "true" ]] && return 0
+  [[ -z "$json" ]] && return 1
+  read -r tracked outdated current cup_unknown <<<"$(cup_compute_counts_from_json "$json")"
+  [[ "$tracked" == "-1" ]] && return 1
+  tracked="$(_cup_sanitize_count "${tracked:-0}")"
+  outdated="$(_cup_sanitize_count "${outdated:-0}")"
+  current="$(_cup_sanitize_count "${current:-0}")"
+  cup_unknown="$(_cup_sanitize_count "${cup_unknown:-0}")"
+  CUP_STATUS="ok"
+  CUP_LAST_ERROR=""
+  CUP_JSON_SNAPSHOT="$json"
+  LAST_CUP_TRACKED="$tracked"
+  LAST_CUP_OUTDATED="$outdated"
+  LAST_CUP_CURRENT="$current"
+  LAST_CUP_UNKNOWN="$cup_unknown"
+  CUP_RUN_TRACKED="$tracked"
+  CUP_RUN_OUTDATED="$outdated"
+  CUP_RUN_CURRENT="$current"
+  CUP_RUN_UNKNOWN="$cup_unknown"
+  CUP_RUN_JSON_SNAPSHOT="$json"
+  CUP_RUN_METRICS_LOCKED="true"
+  _emit_log_file_ts "Cup: locked run snapshot for summary (tracked=${tracked} updates_available=${outdated} up_to_date=${current} unknown=${cup_unknown})"
+  log_verbose "Cup: run snapshot locked for Run Summary / selective (post-stack refresh will not replace these counts)"
+  return 0
 }
 
 docker_running_container_count() {
@@ -2346,12 +2507,25 @@ print_statistics_block() {
   fi
 
   if [[ "${when:-}" == "pipeline_end" ]]; then
-    log_verbose "--- Statistics (pipeline_end): Cup metrics from cache (no refetch) ---"
+    local _v_tr _v_ou _v_cu _v_un
+    if [[ "${CUP_RUN_METRICS_LOCKED:-false}" == "true" ]]; then
+      _v_tr="${CUP_RUN_TRACKED:-}"
+      _v_ou="${CUP_RUN_OUTDATED:-}"
+      _v_cu="${CUP_RUN_CURRENT:-}"
+      _v_un="${CUP_RUN_UNKNOWN:-}"
+      log_verbose "--- Statistics (pipeline_end): Cup run snapshot (locked for this run; no refetch) ---"
+    else
+      _v_tr="${LAST_CUP_TRACKED:-}"
+      _v_ou="${LAST_CUP_OUTDATED:-}"
+      _v_cu="${LAST_CUP_CURRENT:-}"
+      _v_un="${LAST_CUP_UNKNOWN:-}"
+      log_verbose "--- Statistics (pipeline_end): Cup metrics from cache (no refetch) ---"
+    fi
     log_verbose "$(printf '%-32s | %s' "Docker containers (running)" "${dock_running}")"
-    log_verbose "$(printf '%-32s | %s' "Cup entries tracked" "${LAST_CUP_TRACKED:-}")"
-    log_verbose "$(printf '%-32s | %s' "Cup updates available" "${LAST_CUP_OUTDATED:-}")"
-    log_verbose "$(printf '%-32s | %s' "Cup up to date" "${LAST_CUP_CURRENT:-}")"
-    log_verbose "$(printf '%-32s | %s' "Cup unknown" "${LAST_CUP_UNKNOWN:-}")"
+    log_verbose "$(printf '%-32s | %s' "Cup entries tracked" "${_v_tr}")"
+    log_verbose "$(printf '%-32s | %s' "Cup updates available" "${_v_ou}")"
+    log_verbose "$(printf '%-32s | %s' "Cup up to date" "${_v_cu}")"
+    log_verbose "$(printf '%-32s | %s' "Cup unknown" "${_v_un}")"
     log_verbose "--"
     return 0
   fi
@@ -2400,17 +2574,11 @@ print_statistics_block() {
     return 1
   fi
 
-  tracked="$(_cup_sanitize_count "${tracked:-0}")"
-  outdated="$(_cup_sanitize_count "${outdated:-0}")"
-  current="$(_cup_sanitize_count "${current:-0}")"
-  cup_unknown="$(_cup_sanitize_count "${cup_unknown:-0}")"
-  CUP_STATUS="ok"
-  CUP_LAST_ERROR=""
-  CUP_JSON_SNAPSHOT="$json"
-  LAST_CUP_TRACKED="$tracked"
-  LAST_CUP_OUTDATED="$outdated"
-  LAST_CUP_CURRENT="$current"
-  LAST_CUP_UNKNOWN="$cup_unknown"
+  cup_lock_snapshot_from_json_if_unlocked "$json" || true
+  tracked="$LAST_CUP_TRACKED"
+  outdated="$LAST_CUP_OUTDATED"
+  current="$LAST_CUP_CURRENT"
+  cup_unknown="$LAST_CUP_UNKNOWN"
 
   log_verbose "$(printf '%-32s | %s' "Cup entries tracked" "${tracked}")"
   log_verbose "$(printf '%-32s | %s' "Cup updates available" "${outdated}")"
@@ -2505,6 +2673,8 @@ should_skip_stack_phase_for_cup() {
     return 1
   fi
 
+  cup_lock_snapshot_from_json_if_unlocked "$json" || true
+
   if [[ "${outdated:-1}" -eq 0 ]]; then
     log_detail "Cup: outdated count is 0 (tracked=${tracked})."
     return 0
@@ -2527,23 +2697,36 @@ _cup_compose_stack_matches_outdated_ref() {
 
 # One-shot Cup diagnostics (URL, refresh, JSON, metrics, outdated refs, Portainer compose matches).
 cup_run_selftest_phase() {
-  local base sec rf_ok js_ok json tracked outdated current cup_unknown i ref stacks mline code sid sc
+  local base sec rf_ok js_ok json json_before t0 o0 c0 u0 tracked outdated current cup_unknown i ref stacks mline sid sc
   base="${CUP_URL%/}"
   sec="${CUP_REFRESH_TIMEOUT_SECONDS:-60}"
 
   log_step "cup: diagnostics (self-test)"
   log_info "Cup URL: ${CUP_URL:-}"
-  log_info "CUP_REFRESH_BEFORE_CHECK=${CUP_REFRESH_BEFORE_CHECK:-}  CUP_REFRESH_TIMEOUT_SECONDS=${sec}"
+  log_info "CUP_REFRESH_BEFORE_CHECK=${CUP_REFRESH_BEFORE_CHECK:-}  CUP_REFRESH_TIMEOUT_SECONDS=${sec}  CUP_REFRESH_AFTER_STACKS=${CUP_REFRESH_AFTER_STACKS:-}"
+
+  log_info "GET /api/v3/json before explicit refresh (read-only peek; full pipeline uses refresh+poll via cup_fetch_json first):"
+  json_before=""
+  if json_before="$(cup_fetch_json_document 2>/dev/null)" && [[ -n "$json_before" ]]; then
+    read -r t0 o0 c0 u0 <<<"$(cup_compute_counts_from_json "$json_before")"
+    if [[ "$t0" != "-1" ]]; then
+      log_info "  metrics before explicit refresh — tracked=${t0} updates_available=${o0} up_to_date=${c0} unknown=${u0:-0}"
+    else
+      log_info "  (metrics not yet parseable from this JSON)"
+    fi
+  else
+    log_info "  (GET /api/v3/json failed)"
+  fi
 
   rf_ok="skipped (CUP_REFRESH_BEFORE_CHECK=false)"
   if [[ "${CUP_REFRESH_BEFORE_CHECK:-true}" == "true" ]]; then
-    rf_ok="failed"
-    code="$(curl -sS --max-time "$sec" -o /dev/null -w "%{http_code}" -X POST "${base}/api/v3/refresh" 2>/dev/null || printf '%s' "000")"
-    if [[ "$code" =~ ^2 ]]; then
-      rf_ok="ok (POST HTTP ${code})"
+    _emit_log_file_ts "Cup (phase cup): POST ${base}/api/v3/refresh (self-test)"
+    log_info "Calling /api/v3/refresh (cup_http_refresh_once + optional poll)…"
+    if cup_http_refresh_once; then
+      rf_ok="ok HTTP ${CUP_HTTP_REFRESH_LAST_CODE}"
+      cup_poll_json_until_metrics_ready "cup-phase" || true
     else
-      code="$(curl -sS --max-time "$sec" -o /dev/null -w "%{http_code}" "${base}/api/v3/refresh" 2>/dev/null || printf '%s' "000")"
-      [[ "$code" =~ ^2 ]] && rf_ok="ok (GET HTTP ${code})" || rf_ok="failed (last HTTP ${code}; JSON may still work)"
+      rf_ok="failed HTTP ${CUP_HTTP_REFRESH_LAST_CODE:-000}"
     fi
   fi
   log_info "/api/v3/refresh: ${rf_ok}"
@@ -2553,25 +2736,30 @@ cup_run_selftest_phase() {
   if json="$(cup_fetch_json_document 2>/dev/null)" && [[ -n "$json" ]]; then
     js_ok="ok"
   fi
-  log_info "/api/v3/json: ${js_ok}"
+  log_info "/api/v3/json (after refresh path): ${js_ok}"
 
   if [[ "$js_ok" != "ok" ]]; then
     log_warn "Cup self-test: no JSON body to parse."
+    [[ "${CUP_REFRESH_BEFORE_CHECK:-true}" == "true" ]] && CUP_REFRESH_DONE="true"
     return 0
   fi
+
+  log_info "Metrics after refresh path:"
+  read -r tracked outdated current cup_unknown <<<"$(cup_compute_counts_from_json "$json")"
+  if [[ "$tracked" == "-1" ]]; then
+    log_warn "Parsed counts: (unreadable schema)"
+  else
+    log_info "  tracked=${tracked}  updates_available=${outdated}  up_to_date=${current}  unknown=${cup_unknown:-0}"
+  fi
+
+  log_info "Full pipeline: first successful Container Updates parse locks CUP_RUN_* for Run Summary; CUP_JSON_SNAPSHOT drives selective + Portainer Cup pre-check for that run."
+  log_info "This process: CUP_RUN_METRICS_LOCKED=${CUP_RUN_METRICS_LOCKED:-false}  CUP_JSON_SNAPSHOT length=${#CUP_JSON_SNAPSHOT}"
 
   mline="$(echo "$json" | jq -c '.metrics // empty' 2>/dev/null || echo "")"
   if [[ -n "$mline" && "$mline" != "null" ]]; then
     log_info "Raw .metrics: ${mline}"
   else
     log_info "Raw .metrics: (absent)"
-  fi
-
-  read -r tracked outdated current cup_unknown <<<"$(cup_compute_counts_from_json "$json")"
-  if [[ "$tracked" == "-1" ]]; then
-    log_warn "Parsed counts: (unreadable schema)"
-  else
-    log_info "Parsed — tracked: ${tracked}  updates_available: ${outdated}  up_to_date: ${current}  unknown: ${cup_unknown:-0}"
   fi
 
   log_info "First 10 outdated references (Cup) vs Portainer compose image: lines:"
@@ -2597,6 +2785,7 @@ cup_run_selftest_phase() {
     fi
   done < <(cup_outdated_image_lines_from_json "$json" | head -10)
 
+  [[ "${CUP_REFRESH_BEFORE_CHECK:-true}" == "true" ]] && CUP_REFRESH_DONE="true"
   return 0
 }
 
@@ -3909,8 +4098,8 @@ print_run_summary() {
     printf '\n'
     print_info 4 "$(_leg_icon up_to_date) Checked:     ${checked_sum}"
     print_info 4 "$(_leg_icon redeployed) Redeployed:  ${nr}"
-    if [[ -n "${LAST_CUP_OUTDATED:-}" ]] && [[ "${LAST_CUP_OUTDATED}" =~ ^[0-9]+$ ]]; then
-      print_info 4 "$(_leg_icon update_available) Updates available: ${LAST_CUP_OUTDATED}"
+    if [[ -n "${CUP_RUN_OUTDATED:-${LAST_CUP_OUTDATED:-}}" ]] && [[ "${CUP_RUN_OUTDATED:-$LAST_CUP_OUTDATED}" =~ ^[0-9]+$ ]]; then
+      print_info 4 "$(_leg_icon update_available) Updates available: ${CUP_RUN_OUTDATED:-$LAST_CUP_OUTDATED}"
     else
       print_info 4 "$(_leg_icon update_available) Updates available: —"
     fi
@@ -3955,8 +4144,8 @@ print_run_summary() {
 
     if [[ "${SUMMARY_PHASE_STACKS}" == "completed" ]]; then
       if [[ "${nf:-0}" -eq 0 ]] && [[ "${nr:-0}" -eq 0 ]]; then
-        if [[ -n "${LAST_CUP_OUTDATED:-}" ]] && [[ "${LAST_CUP_OUTDATED:-0}" =~ ^[0-9]+$ ]] && [[ "${LAST_CUP_OUTDATED:-0}" -gt 0 ]]; then
-          log_info "$(_leg_icon no_change) Finished stack phase: no stacks redeployed. Cup reports ${LAST_CUP_OUTDATED} image update(s) available; none required a Portainer stack touch for this run."
+        if [[ -n "${CUP_RUN_OUTDATED:-${LAST_CUP_OUTDATED:-}}" ]] && [[ "${CUP_RUN_OUTDATED:-$LAST_CUP_OUTDATED}" =~ ^[0-9]+$ ]] && [[ "${CUP_RUN_OUTDATED:-$LAST_CUP_OUTDATED}" -gt 0 ]]; then
+          log_info "$(_leg_icon no_change) Finished stack phase: no stacks redeployed. Cup reports ${CUP_RUN_OUTDATED:-$LAST_CUP_OUTDATED} image update(s) available; none required a Portainer stack touch for this run."
         else
           log_info "$(_leg_icon no_change) Finished stack phase: no stacks redeployed. No stack image updates were applied (selective / digest / Cup showed nothing to redeploy)."
         fi
@@ -3973,8 +4162,8 @@ print_run_summary() {
     log_info "Counts"
     log_info "  $(_leg_icon up_to_date) Checked:     ${checked_sum}"
     log_info "  $(_leg_icon redeployed) Redeployed:  ${nr}"
-    if [[ -n "${LAST_CUP_OUTDATED:-}" ]] && [[ "${LAST_CUP_OUTDATED}" =~ ^[0-9]+$ ]]; then
-      log_info "  $(_leg_icon update_available) Updates available: ${LAST_CUP_OUTDATED}"
+    if [[ -n "${CUP_RUN_OUTDATED:-${LAST_CUP_OUTDATED:-}}" ]] && [[ "${CUP_RUN_OUTDATED:-$LAST_CUP_OUTDATED}" =~ ^[0-9]+$ ]]; then
+      log_info "  $(_leg_icon update_available) Updates available: ${CUP_RUN_OUTDATED:-$LAST_CUP_OUTDATED}"
     else
       log_info "  $(_leg_icon update_available) Updates available: —"
     fi
@@ -4115,6 +4304,7 @@ run_phases_list() {
           QUIET_STACK_SECTION_DONE="true"
         fi
         _emit_log_file_ts "[pipeline] stacks phase complete"
+        cup_refresh_after_stacks_if_configured || true
         ;;
       cleanup)
         if _quiet_tree_tty && [[ "${QUIET_STACK_SECTION_DONE:-false}" == "true" ]]; then
@@ -4204,6 +4394,7 @@ execute_full_pipeline() {
     QUIET_STACK_SECTION_DONE="true"
   fi
   _emit_log_file_ts "[pipeline] stacks phase complete"
+  cup_refresh_after_stacks_if_configured || true
 
   if _quiet_tree_tty && [[ "${QUIET_STACK_SECTION_DONE:-false}" == "true" ]]; then
     printf '\n'
