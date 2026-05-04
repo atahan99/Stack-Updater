@@ -24,6 +24,7 @@ It does not run `docker compose` directly. Instead, it uses the **Portainer API*
 
 <details>
 <summary>Show menu options</summary>
+
 <p align="center">
   <img src="images/Stack-Updater-Menu.png" alt="Stack Updater output mode menu" width="900">
 </p>
@@ -31,15 +32,20 @@ It does not run `docker compose` directly. Instead, it uses the **Portainer API*
 <p align="center">
   <img src="images/Stack-Updater-Menu2.png" alt="Stack Updater action menu" width="700">
 </p>
-<details>
+
+</details>
+
 ### Quiet run
 
 <details>
 <summary>Show quiet run screenshot</summary>
+
 <p align="center">
   <img src="images/Stack-Updater-Quiet.png" alt="Stack Updater quiet run" width="500">
 </p>
-<details>
+
+</details>
+
 ### Verbose run
 
 <details>
