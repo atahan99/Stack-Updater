@@ -194,6 +194,13 @@ CLEANUP_NETWORK_SUMMARY=""
 CLEANUP_VOLUME_SUMMARY=""
 # Set when quiet-tree legend printed after title (avoid duplicate under Container updates).
 QUIET_TREE_LEGEND_DONE="false"
+# Last redeploy_stack_by_name outcome (for post-redeploy waits; reset each call).
+STACK_LAST_ACTUAL_REDEPLOY=0
+STACK_LAST_DRY_RUN_PLANNED_REDEPLOY=0
+STACK_LAST_REDEPLOY_T0=0
+STACK_LAST_REDEPLOY_SECS=0
+# Seconds slept by the last stack_post_redeploy_wait_for_group call (log / aggregates).
+STACK_LAST_POST_WAIT_SECS=0
 
 reset_full_pipeline_summaries() {
   _PORTAINER_DIGEST_STAT=""
@@ -213,6 +220,11 @@ reset_full_pipeline_summaries() {
   CLEANUP_NETWORK_SUMMARY=""
   CLEANUP_VOLUME_SUMMARY=""
   QUIET_TREE_LEGEND_DONE="false"
+  STACK_LAST_ACTUAL_REDEPLOY=0
+  STACK_LAST_DRY_RUN_PLANNED_REDEPLOY=0
+  STACK_LAST_REDEPLOY_T0=0
+  STACK_LAST_REDEPLOY_SECS=0
+  STACK_LAST_POST_WAIT_SECS=0
   STACK_PHASE_SKIPPED_DUE_CUP="false"
   SUMMARY_PHASE_HOST="not_run"
   SUMMARY_PHASE_DOCKER_PKGS="not_run"
@@ -2661,6 +2673,12 @@ redeploy_regular_stack() {
 redeploy_stack_by_name() {
   local stack_name="$1"
   local quiet_group="${2:-}"
+  local _now
+
+  STACK_LAST_ACTUAL_REDEPLOY=0
+  STACK_LAST_DRY_RUN_PLANNED_REDEPLOY=0
+  STACK_LAST_REDEPLOY_T0=0
+  STACK_LAST_REDEPLOY_SECS=0
 
   progress_child "Resolve stack: ${stack_name}"
 
@@ -2712,6 +2730,8 @@ redeploy_stack_by_name() {
 
   log_detail "Processing stack: ${stack_name} / ID: ${stack_id}"
 
+  STACK_LAST_REDEPLOY_T0="$(date +%s 2>/dev/null || echo 0)"
+
   if is_git_stack "$stack_json"; then
     progress_child "Trigger git redeploy: ${stack_name}"
     redeploy_git_stack "$stack_id" "$stack_name" || {
@@ -2730,7 +2750,12 @@ redeploy_stack_by_name() {
     }
   fi
 
+  _now="$(date +%s 2>/dev/null || echo 0)"
+  STACK_LAST_REDEPLOY_SECS=$((_now - STACK_LAST_REDEPLOY_T0))
+  [[ "${STACK_LAST_REDEPLOY_SECS:-0}" -lt 0 ]] && STACK_LAST_REDEPLOY_SECS=0
+
   if [[ "$DRY_RUN" == "true" ]]; then
+    STACK_LAST_DRY_RUN_PLANNED_REDEPLOY=1
     STACKS_SKIPPED_REASONS+=("${stack_name}|dry-run_planned")
     local _cup_dry=""
     if [[ "${SELECTIVE_STACK_REDEPLOY:-false}" == "true" ]] && [[ "${SELECTIVE_LAST_REASON:-}" == "cup_match" ]] && [[ -n "${SELECTIVE_CUP_MATCH_REF:-}" ]]; then
@@ -2740,6 +2765,7 @@ redeploy_stack_by_name() {
     fi
     [[ -n "$quiet_group" ]] && stack_finalize_stack_ui "$quiet_group" "$stack_name" "dry_run" "${_cup_dry}" "dry-run planned"
   else
+    STACK_LAST_ACTUAL_REDEPLOY=1
     STACKS_REDEPLOYED+=("$stack_name")
     [[ -n "$quiet_group" ]] && _stack_subgroup_bump "$quiet_group" redeployed
     local _cup_rd=""
@@ -2748,13 +2774,96 @@ redeploy_stack_by_name() {
     fi
     [[ -n "$quiet_group" ]] && stack_finalize_stack_ui "$quiet_group" "$stack_name" "redeployed" "${_cup_rd}" "redeployed"
   fi
-
-  sleep "$DEFAULT_STACK_SLEEP_SECONDS"
 }
 
 ########################################
 # WAIT HELPERS
 ########################################
+
+# Format seconds as MM:SS for stack-timing lines.
+_stack_secs_to_mmss() {
+  local s="${1:-0}"
+  local m r
+  m=$((s / 60))
+  r=$((s % 60))
+  printf '%02d:%02d' "$m" "$r"
+}
+
+# After redeploy_stack_by_name: one post-redeploy wait keyed by group (no duplicate default+group sleeps).
+# Uses STACK_LAST_ACTUAL_REDEPLOY, STACK_LAST_DRY_RUN_PLANNED_REDEPLOY, STACK_LAST_REDEPLOY_SECS.
+# Sets STACK_LAST_POST_WAIT_SECS to seconds slept (0 if skipped or dry-run).
+stack_post_redeploy_wait_for_group() {
+  local stack_name="$1"
+  local group="$2"
+  local redeploy_secs="${STACK_LAST_REDEPLOY_SECS:-0}"
+  local t_ws tw tot
+
+  STACK_LAST_POST_WAIT_SECS=0
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    if [[ "${STACK_LAST_DRY_RUN_PLANNED_REDEPLOY:-0}" != "1" ]]; then
+      _emit_log_file_ts "[wait] ${stack_name} unchanged; no wait"
+      return 0
+    fi
+    case "$group" in
+      dependency)
+        _emit_log_file_ts "[wait] ${stack_name} dry-run; would run container readiness (poll) then ${DEPENDENCY_SETTLE_SECONDS}s dependency settle"
+        ;;
+      dependent)
+        _emit_log_file_ts "[wait] ${stack_name} dry-run; would wait ${DEPENDENT_STACK_SLEEP_SECONDS}s after ${stack_name} (dependent)"
+        ;;
+      heavy)
+        _emit_log_file_ts "[wait] ${stack_name} dry-run; would wait ${HEAVY_STACK_SLEEP_SECONDS}s after ${stack_name} (heavy)"
+        ;;
+      remaining)
+        _emit_log_file_ts "[wait] ${stack_name} dry-run; would wait ${DEFAULT_STACK_SLEEP_SECONDS}s after ${stack_name}"
+        ;;
+      *)
+        _emit_log_file_ts "[wait] ${stack_name} dry-run; would wait ${DEFAULT_STACK_SLEEP_SECONDS}s after ${stack_name}"
+        ;;
+    esac
+    _emit_log_file_ts "[stack-timing] ${stack_name} redeploy=$(_stack_secs_to_mmss "$redeploy_secs") wait=00:00 total=$(_stack_secs_to_mmss "$redeploy_secs")"
+    return 0
+  fi
+
+  if [[ "${STACK_LAST_ACTUAL_REDEPLOY:-0}" != "1" ]]; then
+    _emit_log_file_ts "[wait] ${stack_name} unchanged; no wait"
+    return 0
+  fi
+
+  t_ws="$(date +%s 2>/dev/null || echo 0)"
+  case "$group" in
+    dependency)
+      _emit_log_file_ts "[wait] ${stack_name} redeployed; dependency settle (container check + ${DEPENDENCY_SETTLE_SECONDS}s)"
+      progress_child "Wait for service container: ${stack_name}"
+      wait_for_container_running "$stack_name" 300 || true
+      log_detail "Giving dependency stack '${stack_name}' ${DEPENDENCY_SETTLE_SECONDS}s to settle..."
+      progress_child "Settling after dependency stack: ${stack_name} (${DEPENDENCY_SETTLE_SECONDS}s)"
+      sleep "$DEPENDENCY_SETTLE_SECONDS"
+      ;;
+    dependent)
+      _emit_log_file_ts "[wait] ${stack_name} redeployed; dependent wait ${DEPENDENT_STACK_SLEEP_SECONDS}s"
+      sleep "$DEPENDENT_STACK_SLEEP_SECONDS"
+      ;;
+    heavy)
+      _emit_log_file_ts "[wait] ${stack_name} redeployed; heavy wait ${HEAVY_STACK_SLEEP_SECONDS}s"
+      sleep "$HEAVY_STACK_SLEEP_SECONDS"
+      ;;
+    remaining)
+      _emit_log_file_ts "[wait] ${stack_name} redeployed; sleeping ${DEFAULT_STACK_SLEEP_SECONDS}s"
+      sleep "$DEFAULT_STACK_SLEEP_SECONDS"
+      ;;
+    *)
+      _emit_log_file_ts "[wait] ${stack_name} redeployed; sleeping ${DEFAULT_STACK_SLEEP_SECONDS}s"
+      sleep "$DEFAULT_STACK_SLEEP_SECONDS"
+      ;;
+  esac
+  tw=$(($(date +%s 2>/dev/null || echo 0) - t_ws))
+  [[ "$tw" -lt 0 ]] && tw=0
+  STACK_LAST_POST_WAIT_SECS=$tw
+  tot=$((redeploy_secs + tw))
+  _emit_log_file_ts "[stack-timing] ${stack_name} redeploy=$(_stack_secs_to_mmss "$redeploy_secs") wait=$(_stack_secs_to_mmss "$tw") total=$(_stack_secs_to_mmss "$tot")"
+}
 
 container_is_running() {
   local container_name="$1"
@@ -2781,15 +2890,6 @@ wait_for_container_running() {
 
   log_warn "Timed out waiting for container '${container_name}'."
   return 1
-}
-
-wait_for_dependency_stack_ready() {
-  local stack_name="$1"
-  progress_child "Wait for service container: ${stack_name}"
-  wait_for_container_running "$stack_name" 300 || true
-  log_detail "Giving dependency stack '${stack_name}' ${DEPENDENCY_SETTLE_SECONDS}s to settle..."
-  progress_child "Settling after dependency stack: ${stack_name} (${DEPENDENCY_SETTLE_SECONDS}s)"
-  sleep "$DEPENDENCY_SETTLE_SECONDS"
 }
 
 ########################################
@@ -2878,7 +2978,7 @@ update_docker_packages() {
 ########################################
 
 deploy_dependency_stacks() {
-  local stack_name
+  local stack_name dep_any_redeployed=0 dep_wait_total=0
 
   _quiet_tree_tty && printf '\n'
   _quiet_tree_tty && quiet_stack_subgroup_title "$(_stack_group_display_name dependency)"
@@ -2912,8 +3012,25 @@ deploy_dependency_stacks() {
       continue
     }
 
-    wait_for_dependency_stack_ready "$stack_name"
+    stack_post_redeploy_wait_for_group "$stack_name" dependency
+    if [[ "${STACK_LAST_ACTUAL_REDEPLOY:-0}" == "1" ]]; then
+      dep_any_redeployed=1
+    fi
+    dep_wait_total=$((dep_wait_total + STACK_LAST_POST_WAIT_SECS))
   done
+
+  if [[ "$dep_any_redeployed" -eq 0 ]]; then
+    if [[ "$DRY_RUN" == "true" ]]; then
+      _emit_log_file_ts "[wait] dependency group dry-run; no actual dependency settle"
+      _emit_log_file_ts "[stack-timing] dependency_settle dry-run; no actual sleeps"
+    else
+      _emit_log_file_ts "[wait] dependency group unchanged; no dependency settle"
+      _emit_log_file_ts "[stack-timing] dependency_settle skipped; no dependency stack redeployed"
+    fi
+  else
+    _emit_log_file_ts "[stack-timing] dependency group finished; dependency_post_redeploy_wait_total=${dep_wait_total}s"
+  fi
+
   quiet_stack_group_summary "$(_stack_group_display_name dependency)" "${STACK_GRP_DEP_CHECKED}" "${STACK_GRP_DEP_REDEPLOYED}" "${STACK_GRP_DEP_FAILED}"
   SUMMARY_STACK_SUB_DEPENDENCY="completed"
 }
@@ -2941,7 +3058,7 @@ deploy_dependent_stacks() {
       continue
     }
 
-    sleep "$DEPENDENT_STACK_SLEEP_SECONDS"
+    stack_post_redeploy_wait_for_group "$stack_name" dependent
   done
   quiet_stack_group_summary "$(_stack_group_display_name dependent)" "${STACK_GRP_DEPENDENT_CHECKED}" "${STACK_GRP_DEPENDENT_REDEPLOYED}" "${STACK_GRP_DEPENDENT_FAILED}"
   SUMMARY_STACK_SUB_DEPENDENT="completed"
@@ -2980,8 +3097,7 @@ deploy_heavy_stacks() {
       continue
     }
 
-    log_detail "Heavy stack ${stack_name}: waiting extra ${HEAVY_STACK_SLEEP_SECONDS}s."
-    sleep "$HEAVY_STACK_SLEEP_SECONDS"
+    stack_post_redeploy_wait_for_group "$stack_name" heavy
   done
   quiet_stack_group_summary "$(_stack_group_display_name heavy)" "${STACK_GRP_HEAVY_CHECKED}" "${STACK_GRP_HEAVY_REDEPLOYED}" "${STACK_GRP_HEAVY_FAILED}"
   SUMMARY_STACK_SUB_HEAVY="completed"
@@ -3014,6 +3130,8 @@ deploy_remaining_non_heavy_stacks() {
       log_warn "Failed redeploying ${stack_name}; continuing."
       continue
     }
+
+    stack_post_redeploy_wait_for_group "$stack_name" remaining
 
   done < <(get_all_stack_names_for_endpoint)
   quiet_stack_group_summary "$(_stack_group_display_name remaining)" "${STACK_GRP_REMAINING_CHECKED}" "${STACK_GRP_REMAINING_REDEPLOYED}" "${STACK_GRP_REMAINING_FAILED}"
