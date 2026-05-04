@@ -1,0 +1,9 @@
+# Local secrets — copy from config.env.example
+config.env
+*.env.local
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
