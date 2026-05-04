@@ -16,7 +16,7 @@ set -Eeuo pipefail
 # the full pipeline. Use --batch to force full run from an interactive shell.
 ########################################
 
-STACK_UPDATER_VERSION="1.3.7"
+STACK_UPDATER_VERSION="1.0"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

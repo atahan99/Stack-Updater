@@ -18,6 +18,35 @@ It does not run `docker compose` directly. Instead, it uses the **Portainer API*
 - Quiet dashboard output with detailed logs.
 - Interactive Gum menu plus batch/cron-friendly CLI flags.
 
+## Screenshots
+
+### Interactive menu
+
+<p align="center">
+  <img src="images/Stack-Updater-Menu.png" alt="Stack Updater output mode menu" width="900">
+</p>
+
+<p align="center">
+  <img src="images/Stack-Updater-Menu2.png" alt="Stack Updater action menu" width="700">
+</p>
+
+### Quiet run
+
+<p align="center">
+  <img src="images/Stack-Updater-Quiet.png" alt="Stack Updater quiet run" width="500">
+</p>
+
+### Verbose run
+
+<details>
+<summary>Show verbose run screenshot</summary>
+
+<p align="center">
+  <img src="images/Stack-Updater-Full-Verbose.png" alt="Stack Updater verbose run" width="500">
+</p>
+
+</details>
+
 ## Default run
 
 With the default config, a full run:
