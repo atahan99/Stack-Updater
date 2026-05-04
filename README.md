@@ -26,7 +26,7 @@ It does not run `docker compose` directly. Instead, it uses the **Portainer API*
 <summary>Show menu options</summary>
 
 <p align="center">
-  <img src="images/Stack-Updater-Menu.png" alt="Stack Updater output mode menu" width="900">
+  <img src="images/Stack-Updater-Menu.png" alt="Stack Updater output mode menu" width="700">
 </p>
 
 <p align="center">
@@ -50,6 +50,8 @@ It does not run `docker compose` directly. Instead, it uses the **Portainer API*
 
 <details>
 <summary>Show verbose run screenshot</summary>
+
+This is the same kind of detail you get in the `stack-updater.log` file created on each run (see `LOG_FILE` in your config)—full diagnostic text, not the quiet on-screen summary.
 
 <p align="center">
   <img src="images/Stack-Updater-Full-Verbose.png" alt="Stack Updater verbose run" width="500">
