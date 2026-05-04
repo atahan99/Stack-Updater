@@ -2321,10 +2321,6 @@ cup_refresh_after_stacks_if_configured() {
   log_verbose "Cup (post-stack): POST ${base}/api/v3/refresh after ${#STACKS_REDEPLOYED[@]} stack redeploy(s)"
   _emit_log_file_ts "Cup (post-stack): requesting /api/v3/refresh at ${base} (${#STACKS_REDEPLOYED[@]} redeploy(s); diagnostic only, not used for this run summary)"
 
-  if _quiet_tree_tty; then
-    print_info 4 "$(_leg_icon in_progress) Refreshing Cup after stack updates…"
-  fi
-
   CUP_POST_TRACKED=""
   CUP_POST_OUTDATED=""
   CUP_POST_CURRENT=""
@@ -2346,9 +2342,6 @@ cup_refresh_after_stacks_if_configured() {
         _emit_log_file_ts "Cup (post-stack): metrics after refresh — tracked=${t} updates_available=${o} up_to_date=${c} unknown=${u:-0}"
         log_verbose "Cup (post-stack): metrics after refresh — tracked=${t} updates=${o} up_to_date=${c} unknown=${u:-0}"
       fi
-    fi
-    if _quiet_tree_tty; then
-      print_info 4 "$(tty_checkmark) Cup refresh requested"
     fi
   else
     log_warn "Cup (post-stack): /api/v3/refresh failed (${CUP_URL:-} HTTP ${CUP_HTTP_REFRESH_LAST_CODE:-000}); Cup UI may be stale until next scan."
@@ -4046,9 +4039,32 @@ _phase_secs_fmt_or_dash() {
   _format_mm_ss "$1"
 }
 
+# RUN SUMMARY container rows only: pre-run Cup snapshot (CUP_RUN_* / LAST_*). Never CUP_POST_*.
+_run_summary_resolve_cup_counts() {
+  local dash="—"
+  if [[ "${CUP_ENABLED:-false}" != "true" ]]; then
+    printf '%s' "${dash}|${dash}|${dash}|${dash}"
+    return 0
+  fi
+  if [[ "${CUP_RUN_METRICS_LOCKED:-false}" == "true" ]]; then
+    printf '%s' "$(_cup_sanitize_count "${CUP_RUN_TRACKED:-0}")|$(_cup_sanitize_count "${CUP_RUN_OUTDATED:-0}")|$(_cup_sanitize_count "${CUP_RUN_CURRENT:-0}")|$(_cup_sanitize_count "${CUP_RUN_UNKNOWN:-0}")"
+    return 0
+  fi
+  if [[ "${CUP_STATUS:-}" == "ok" ]] &&
+    [[ "${LAST_CUP_TRACKED:-}" =~ ^[0-9]+$ ]] &&
+    [[ "${LAST_CUP_OUTDATED:-}" =~ ^[0-9]+$ ]] &&
+    [[ "${LAST_CUP_CURRENT:-}" =~ ^[0-9]+$ ]] &&
+    [[ "${LAST_CUP_UNKNOWN:-}" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$(_cup_sanitize_count "${LAST_CUP_TRACKED}")|$(_cup_sanitize_count "${LAST_CUP_OUTDATED}")|$(_cup_sanitize_count "${LAST_CUP_CURRENT}")|$(_cup_sanitize_count "${LAST_CUP_UNKNOWN}")"
+    return 0
+  fi
+  printf '%s' "${dash}|${dash}|${dash}|${dash}"
+}
+
 print_run_summary() {
   local _sum_banner="======================== RUN SUMMARY ========================"
   local s name reason glyph line elapsed end_ts nf nr checked_sum unchanged_ct skipped_ct total_elapsed
+  local _cup_tr _cup_ou _cup_cu _cup_un
   nf="$(_count_redeploy_failed_in_notes)"
   nr="${#STACKS_REDEPLOYED[@]}"
   checked_sum=$((STACK_GRP_DEP_CHECKED + STACK_GRP_DEPENDENT_CHECKED + STACK_GRP_HEAVY_CHECKED + STACK_GRP_REMAINING_CHECKED))
@@ -4065,6 +4081,8 @@ print_run_summary() {
       *) ;;
     esac
   done
+
+  IFS='|' read -r _cup_tr _cup_ou _cup_cu _cup_un <<<"$(_run_summary_resolve_cup_counts)"
 
   LAST_PIPELINE_EXIT_CODE=0
   [[ "${nf:-0}" -gt 0 ]] && LAST_PIPELINE_EXIT_CODE=1
@@ -4094,18 +4112,25 @@ print_run_summary() {
     fi
 
     printf '\n'
-    print_info 4 "Counts"
+    print_info 4 "Stack counts"
     printf '\n'
     print_info 4 "$(_leg_icon up_to_date) Checked:     ${checked_sum}"
     print_info 4 "$(_leg_icon redeployed) Redeployed:  ${nr}"
-    if [[ -n "${CUP_RUN_OUTDATED:-${LAST_CUP_OUTDATED:-}}" ]] && [[ "${CUP_RUN_OUTDATED:-$LAST_CUP_OUTDATED}" =~ ^[0-9]+$ ]]; then
-      print_info 4 "$(_leg_icon update_available) Updates available: ${CUP_RUN_OUTDATED:-$LAST_CUP_OUTDATED}"
-    else
-      print_info 4 "$(_leg_icon update_available) Updates available: —"
-    fi
     print_info 4 "$(_leg_icon no_change) Unchanged:   ${unchanged_ct}"
     print_info 4 "$(_leg_icon skipped) Skipped:     ${skipped_ct}"
     print_info 4 "$(_leg_icon failed) Failed:      ${nf}"
+
+    printf '\n'
+    print_info 4 "Container counts"
+    printf '\n'
+    print_info 4 "$(_leg_icon no_change) Tracked:     ${_cup_tr}"
+    print_info 4 "$(cup_update_icon) Updates available: ${_cup_ou}"
+    print_info 4 "$(_leg_icon up_to_date) Up-to-date:  ${_cup_cu}"
+    print_info 4 "❔ Unknown:     ${_cup_un}"
+
+    printf '\n'
+    print_info 4 "Warnings"
+    printf '\n'
     print_info 4 "$(_leg_icon warnings) Warnings:    ${RUN_WARNING_COUNT:-0}"
 
     printf '\n'
@@ -4159,17 +4184,22 @@ print_run_summary() {
     fi
 
     log_info ""
-    log_info "Counts"
+    log_info "Stack counts"
     log_info "  $(_leg_icon up_to_date) Checked:     ${checked_sum}"
     log_info "  $(_leg_icon redeployed) Redeployed:  ${nr}"
-    if [[ -n "${CUP_RUN_OUTDATED:-${LAST_CUP_OUTDATED:-}}" ]] && [[ "${CUP_RUN_OUTDATED:-$LAST_CUP_OUTDATED}" =~ ^[0-9]+$ ]]; then
-      log_info "  $(_leg_icon update_available) Updates available: ${CUP_RUN_OUTDATED:-$LAST_CUP_OUTDATED}"
-    else
-      log_info "  $(_leg_icon update_available) Updates available: —"
-    fi
     log_info "  $(_leg_icon no_change) Unchanged:   ${unchanged_ct}"
     log_info "  $(_leg_icon skipped) Skipped:     ${skipped_ct}"
     log_info "  $(_leg_icon failed) Failed:      ${nf}"
+
+    log_info ""
+    log_info "Container counts"
+    log_info "  $(_leg_icon no_change) Tracked:     ${_cup_tr}"
+    log_info "  $(cup_update_icon) Updates available: ${_cup_ou}"
+    log_info "  $(_leg_icon up_to_date) Up-to-date:  ${_cup_cu}"
+    log_info "  ❔ Unknown:     ${_cup_un}"
+
+    log_info ""
+    log_info "Warnings"
     log_info "  $(_leg_icon warnings) Warnings:    ${RUN_WARNING_COUNT:-0}"
 
     log_info ""
