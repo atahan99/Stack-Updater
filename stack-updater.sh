@@ -787,7 +787,10 @@ print_progress() {
 }
 
 finish_progress() {
-  _stack_progress_live_ok && stack_progress_live_clear_safe
+  if _stack_progress_live_ok; then
+    stack_progress_live_clear_safe
+  fi
+  return 0
 }
 
 _stack_group_display_name() {
@@ -1630,12 +1633,19 @@ portainer_quiet_ui_container_outcome() {
 # to suppress refresh_stacks_cache's quiet_live line (section already printed the substep).
 portainer_quiet_ui_api_validate_and_refresh_cache() {
   local no_cat_live="${1:-}"
-  _quiet_tree_tty && print_info 2 "$(_leg_icon in_progress) Re-validating Portainer API…"
+  if _quiet_tree_tty; then
+    print_info 2 "$(_leg_icon in_progress) Re-validating Portainer API…"
+  fi
   invalidate_stacks_cache
   check_requirements
-  _quiet_tree_tty && print_info 2 "$(_leg_icon in_progress) Refreshing stack cache…"
+  if _quiet_tree_tty; then
+    print_info 2 "$(_leg_icon in_progress) Refreshing stack cache…"
+  fi
   refresh_stacks_cache "${no_cat_live}"
-  _quiet_tree_tty && print_info 2 "$(tty_checkmark) Portainer ready"
+  if _quiet_tree_tty; then
+    print_info 2 "$(tty_checkmark) Portainer ready"
+  fi
+  return 0
 }
 
 invalidate_stacks_cache() {
@@ -1654,6 +1664,7 @@ refresh_stacks_cache() {
   [[ "$ec" -eq 0 ]] || return "$ec"
   STACKS_JSON_CACHE="$fetched"
   progress_child "Refresh stack catalog (Portainer)"
+  return 0
 }
 
 api_get() {
@@ -2413,39 +2424,41 @@ print_statistics_block() {
   fi
 
   if [[ "${OUTPUT_MODE:-quiet}" == "verbose" ]]; then
-    echo "$json" | jq -r '
-      [
-        (.images // [])[]?
-        | select(
-            ((.result // empty | type == "object") and .result.has_update == true)
-            or (.update_available == true)
-          )
-        | {
-            r: (.reference // .image // .name // ""),
-            c: (.result.info.current_version // .result.info.current_tag // ""),
-            n: (.result.info.new_version // .result.info.new_tag // ""),
-            t: (.result.info.version_update_type // .result.info.type // "")
-          },
-        (.containers // [])[]?
-        | select(
-            ((.result // empty | type == "object") and .result.has_update == true)
-            or (.update_available == true)
-          )
-        | {
-            r: (.image // .name // .reference // ""),
-            c: (.result.info.current_version // .result.info.current_tag // ""),
-            n: (.result.info.new_version // .result.info.new_tag // ""),
-            t: (.result.info.version_update_type // .result.info.type // "")
-          }
-      ]
-      | map(select((.r | type == "string") and (.r | length) > 0))
-      | group_by(.r)
-      | map(.[0])
-      | .[0:40][]
-      | "outdated: \(.r) \(.c) → \(.n) \(.t)"
-    ' 2>/dev/null | while read -r line; do
-      [[ -n "$line" ]] && log_detail "  $line"
-    done
+    {
+      echo "$json" | jq -r '
+        [
+          (.images // [])[]?
+          | select(
+              ((.result // empty | type == "object") and .result.has_update == true)
+              or (.update_available == true)
+            )
+          | {
+              r: (.reference // .image // .name // ""),
+              c: (.result.info.current_version // .result.info.current_tag // ""),
+              n: (.result.info.new_version // .result.info.new_tag // ""),
+              t: (.result.info.version_update_type // .result.info.type // "")
+            },
+          (.containers // [])[]?
+          | select(
+              ((.result // empty | type == "object") and .result.has_update == true)
+              or (.update_available == true)
+            )
+          | {
+              r: (.image // .name // .reference // ""),
+              c: (.result.info.current_version // .result.info.current_tag // ""),
+              n: (.result.info.new_version // .result.info.new_tag // ""),
+              t: (.result.info.version_update_type // .result.info.type // "")
+            }
+        ]
+        | map(select((.r | type == "string") and (.r | length) > 0))
+        | group_by(.r)
+        | map(.[0])
+        | .[0:40][]
+        | "outdated: \(.r) \(.c) → \(.n) \(.t)"
+      ' 2>/dev/null | while read -r line; do
+        [[ -n "$line" ]] && log_detail "  $line"
+      done
+    } || true
   fi
 
   log_verbose "--"
@@ -2980,10 +2993,14 @@ update_docker_packages() {
 deploy_dependency_stacks() {
   local stack_name dep_any_redeployed=0 dep_wait_total=0
 
-  _quiet_tree_tty && printf '\n'
-  _quiet_tree_tty && quiet_stack_subgroup_title "$(_stack_group_display_name dependency)"
+  if _quiet_tree_tty; then
+    printf '\n'
+    quiet_stack_subgroup_title "$(_stack_group_display_name dependency)"
+  fi
   if [[ "${#DEPENDENCY_STACKS[@]}" -eq 0 ]]; then
-    _quiet_tree_tty && quiet_subnote_dim "(none configured)"
+    if _quiet_tree_tty; then
+      quiet_subnote_dim "(none configured)"
+    fi
     log_detail "No dependency stacks configured."
     SUMMARY_STACK_SUB_DEPENDENCY="none configured"
     return 0
@@ -3038,10 +3055,14 @@ deploy_dependency_stacks() {
 deploy_dependent_stacks() {
   local stack_name
 
-  _quiet_tree_tty && printf '\n'
-  _quiet_tree_tty && quiet_stack_subgroup_title "$(_stack_group_display_name dependent)"
+  if _quiet_tree_tty; then
+    printf '\n'
+    quiet_stack_subgroup_title "$(_stack_group_display_name dependent)"
+  fi
   if [[ "${#DEPENDENT_STACKS[@]}" -eq 0 ]]; then
-    _quiet_tree_tty && quiet_subnote_dim "(none configured)"
+    if _quiet_tree_tty; then
+      quiet_subnote_dim "(none configured)"
+    fi
     log_detail "No dependent stacks configured."
     SUMMARY_STACK_SUB_DEPENDENT="none configured"
     return 0
@@ -3067,10 +3088,14 @@ deploy_dependent_stacks() {
 deploy_heavy_stacks() {
   local stack_name _hid
 
-  _quiet_tree_tty && printf '\n'
-  _quiet_tree_tty && quiet_stack_subgroup_title "$(_stack_group_display_name heavy)"
+  if _quiet_tree_tty; then
+    printf '\n'
+    quiet_stack_subgroup_title "$(_stack_group_display_name heavy)"
+  fi
   if [[ "${#HEAVY_STACKS[@]}" -eq 0 ]]; then
-    _quiet_tree_tty && quiet_subnote_dim "(none configured)"
+    if _quiet_tree_tty; then
+      quiet_subnote_dim "(none configured)"
+    fi
     log_detail "No heavy stacks configured."
     SUMMARY_STACK_SUB_HEAVY="none configured"
     return 0
@@ -3106,8 +3131,10 @@ deploy_heavy_stacks() {
 deploy_remaining_non_heavy_stacks() {
   local stack_name
 
-  _quiet_tree_tty && printf '\n'
-  _quiet_tree_tty && quiet_stack_subgroup_title "$(_stack_group_display_name remaining)"
+  if _quiet_tree_tty; then
+    printf '\n'
+    quiet_stack_subgroup_title "$(_stack_group_display_name remaining)"
+  fi
   log_step "stacks: remaining (non-heavy on endpoint)"
   progress_child "Remaining stacks (non-heavy on endpoint)"
 
@@ -3141,7 +3168,7 @@ deploy_remaining_non_heavy_stacks() {
 deploy_in_correct_order() {
   init_selective_context
   compute_stack_deploy_total
-  _quiet_tree_tty && quiet_print_tree_banner_rule "STACK UPDATES"
+  quiet_print_tree_banner_rule "STACK UPDATES"
   progress_child "Deploy stacks: dependencies → dependents → heavy → remaining"
   deploy_dependency_stacks
   deploy_dependent_stacks
@@ -3306,10 +3333,14 @@ update_portainer_container_if_enabled() {
       return 0
     fi
     if [[ "${PORTAINER_REQUIRE_BACKUP_BEFORE_UPDATE:-false}" != "true" ]]; then
-      _quiet_tree_tty && print_warning 2 "Portainer backup recommended before install/upgrade (see Portainer documentation)."
+      if _quiet_tree_tty; then
+        print_warning 2 "Portainer backup recommended before install/upgrade (see Portainer documentation)."
+      fi
     fi
     portainer_warn_if_agent_present
-    _quiet_tree_tty && print_info 2 "$(_leg_icon update_available) Portainer image: update available"
+    if _quiet_tree_tty; then
+      print_info 2 "$(_leg_icon update_available) Portainer image: update available"
+    fi
     portainer_quiet_ui_container_begin
     local -a pub_new=()
     pub_new+=(-p "9443:9443")
@@ -3346,13 +3377,17 @@ update_portainer_container_if_enabled() {
   fi
 
   if [[ "${PORTAINER_REQUIRE_BACKUP_BEFORE_UPDATE:-false}" != "true" ]]; then
-    _quiet_tree_tty && print_warning 2 "Portainer backup recommended before upgrade (see Portainer documentation)."
+    if _quiet_tree_tty; then
+      print_warning 2 "Portainer backup recommended before upgrade (see Portainer documentation)."
+    fi
   fi
 
   portainer_warn_if_losing_legacy_http_port
   portainer_warn_if_agent_present
 
-  _quiet_tree_tty && print_info 2 "$(_leg_icon update_available) Portainer image: update available"
+  if _quiet_tree_tty; then
+    print_info 2 "$(_leg_icon update_available) Portainer image: update available"
+  fi
   portainer_quiet_ui_container_begin
 
   log_detail "Stopping Portainer container..."
@@ -3774,10 +3809,11 @@ run_stacks_phase_with_cup_gate() {
     STACK_PHASE_SKIPPED_DUE_CUP=true
     SUMMARY_PHASE_STACKS="skipped_no_cup_updates"
     log_step "stacks: skipped (Cup reports no image updates; SKIP_STACK_PHASE_IF_CUP_CLEAN=true)"
-    _quiet_tree_tty && quiet_print_tree_banner_rule "STACK UPDATES"
+    quiet_print_tree_banner_rule "STACK UPDATES"
     quiet_subnote_dim "Stacks phase skipped (Cup reports no image updates; SKIP_STACK_PHASE_IF_CUP_CLEAN)."
     return 0
   fi
+  _emit_log_file_ts "[pipeline] stacks phase starting"
   prompt_stack_update_confirmation
   deploy_in_correct_order
   SUMMARY_PHASE_STACKS="completed"
@@ -4055,6 +4091,7 @@ run_phases_list() {
         portainer_quiet_ui_container_outcome
         log_step "preflight: re-check Portainer API after Portainer phase"
         portainer_quiet_ui_api_validate_and_refresh_cache "no_catalog_live"
+        _emit_log_file_ts "[pipeline] portainer phase complete"
         ;;
       cup)
         quiet_ensure_section green "System"
@@ -4063,7 +4100,9 @@ run_phases_list() {
         cup_run_selftest_phase || true
         ;;
       stacks)
+        _emit_log_file_ts "[pipeline] update strategy printing"
         quiet_print_update_strategy_block
+        _emit_log_file_ts "[pipeline] update strategy complete"
         confirm_step "Proceed with phase: redeploy all stacks?"
         log_step "phase: stacks"
         _t="$(date +%s)"
@@ -4072,7 +4111,9 @@ run_phases_list() {
         if [[ "$STACK_PHASE_SKIPPED_DUE_CUP" != "true" ]] && [[ "${SUMMARY_PHASE_STACKS}" == "completed" ]]; then
           quiet_print_stack_subgroup_metrics_block || true
         fi
-        _quiet_tree_tty && QUIET_STACK_SECTION_DONE="true"
+        if _quiet_tree_tty; then
+          QUIET_STACK_SECTION_DONE="true"
+        fi
         _emit_log_file_ts "[pipeline] stacks phase complete"
         ;;
       cleanup)
@@ -4102,6 +4143,7 @@ run_phases_list() {
   _emit_log_file_ts "[pipeline] run summary printing"
   print_run_summary || true
   _emit_log_file_ts "[pipeline] run summary complete"
+  _emit_log_file_ts "[pipeline] full pipeline complete"
 }
 
 execute_full_pipeline() {
@@ -4143,8 +4185,11 @@ execute_full_pipeline() {
 
   log_step "preflight: re-check Portainer API after Portainer update"
   portainer_quiet_ui_api_validate_and_refresh_cache "no_catalog_live"
+  _emit_log_file_ts "[pipeline] portainer phase complete"
 
+  _emit_log_file_ts "[pipeline] update strategy printing"
   quiet_print_update_strategy_block
+  _emit_log_file_ts "[pipeline] update strategy complete"
 
   confirm_step "Run step: redeploy stacks + cleanup?"
   _t="$(date +%s)"
@@ -4155,7 +4200,9 @@ execute_full_pipeline() {
     quiet_print_stack_subgroup_metrics_block || true
   fi
 
-  _quiet_tree_tty && QUIET_STACK_SECTION_DONE="true"
+  if _quiet_tree_tty; then
+    QUIET_STACK_SECTION_DONE="true"
+  fi
   _emit_log_file_ts "[pipeline] stacks phase complete"
 
   if _quiet_tree_tty && [[ "${QUIET_STACK_SECTION_DONE:-false}" == "true" ]]; then
@@ -4179,6 +4226,7 @@ execute_full_pipeline() {
   _emit_log_file_ts "[pipeline] run summary printing"
   print_run_summary || true
   _emit_log_file_ts "[pipeline] run summary complete"
+  _emit_log_file_ts "[pipeline] full pipeline complete"
 
   log_step "full pipeline complete"
 }
