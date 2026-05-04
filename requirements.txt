@@ -1,0 +1,17 @@
+# =============================================================================
+# Debian / Ubuntu — one package name per non-comment line.
+# Used by install-deps.sh (apt-get install). Lines starting with # are ignored.
+# =============================================================================
+
+jq
+curl
+ca-certificates
+gnupg
+nala
+
+# Gum (interactive menus) is installed via Charm’s APT repo — ./install-deps.sh adds the repo and installs gum.
+
+# =============================================================================
+# Other distributions — not wired into install-deps.sh yet; reserved for future
+# sections (e.g. RPM/DNF package names) or a separate installer.
+# =============================================================================
