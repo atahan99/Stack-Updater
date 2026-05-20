@@ -16,9 +16,14 @@ set -Eeuo pipefail
 # the full pipeline. Use --batch to force full run from an interactive shell.
 ########################################
 
-STACK_UPDATER_VERSION="1.0"
+STACK_UPDATER_VERSION="1.1.0"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ -f "$SCRIPT_DIR/lib/stack-updater-core.sh" ]]; then
+  # shellcheck source=lib/stack-updater-core.sh
+  source "$SCRIPT_DIR/lib/stack-updater-core.sh"
+fi
 
 _ENV_CONFIG_SET="false"
 [[ "${CONFIG_FILE+isset}" == "isset" ]] && _ENV_CONFIG_SET="true"
@@ -50,8 +55,6 @@ PRUNE_UNUSED_VOLUMES="false"
 
 SKIP_HOST_IF_NONE="false"
 SKIP_DOCKER_PKGS_IF_NONE="false"
-# Legacy TUI flag (digest-era); Portainer self-update no longer uses digest for recreate decisions.
-SKIP_PORTAINER_PULL_IF_CURRENT="false"
 STACK_UPDATE_PROMPT="false"
 
 VERBOSE="false"
@@ -102,6 +105,35 @@ DEPENDENT_STACKS=()
 EXCLUDED_STACKS=()
 HEAVY_STACKS=()
 
+# Concurrency / exit policy (see config.env.example).
+LOCK_FILE=""
+SKIP_RUN_LOCK="false"
+PIPELINE_HARD_FAILURE=0
+EXIT_WARNINGS_AS_FAILURE="false"
+
+# Notifications (optional).
+NOTIFY_ON_FAILURE="true"
+NOTIFY_ON_SUCCESS="false"
+NOTIFY_COMMAND=""
+NOTIFY_WEBHOOK_URL=""
+
+# Log rotation (bytes; 0 = disabled).
+LOG_MAX_BYTES="5242880"
+
+# Portainer API TLS (default insecure for localhost Portainer HTTPS).
+PORTAINER_TLS_VERIFY="false"
+PORTAINER_CA_BUNDLE=""
+PORTAINER_API_KEY_FILE=""
+
+# Portainer recreate safety.
+PORTAINER_RECREATE_ACK_DIVERGENCE="false"
+
+# Image prune retention (e.g. 24h); empty = prune all unused (-af).
+PRUNE_IMAGES_UNTIL=""
+
+# Single-stack CLI override (empty = all stacks).
+SINGLE_STACK_NAME=""
+
 ########################################
 # CLI STATE (parsed before sourcing config)
 ########################################
@@ -117,6 +149,7 @@ OUTPUT_MODE_CLI=""
 CONFIRM_STEPS_CLI="false"
 NO_COLOR_CLI="false"
 SELF_TEST="false"
+SHOW_VERSION="false"
 
 EMPTY_INVOCATION="false"
 declare -a PHASE_QUEUE=()
@@ -219,6 +252,13 @@ STACK_LAST_REDEPLOY_SECS=0
 # Seconds slept by the last stack_post_redeploy_wait_for_group call (log / aggregates).
 STACK_LAST_POST_WAIT_SECS=0
 
+# Runtime lock / temp tracking.
+RUN_LOCK_ACQUIRED="false"
+LOCK_FD=200
+declare -a _TEMP_FILES=()
+STACK_UPDATER_TRAP_REGISTERED="false"
+USER_CANCELLED="false"
+
 reset_full_pipeline_summaries() {
   _PORTAINER_DIGEST_STAT=""
   _PORTAINER_REG_DIGEST=""
@@ -286,6 +326,7 @@ reset_full_pipeline_summaries() {
   STACK_GRP_REMAINING_REDEPLOYED=0
   STACK_GRP_REMAINING_FAILED=0
   RUN_WARNING_COUNT=0
+  PIPELINE_HARD_FAILURE=0
   DOCKER_VER_DISPLAY=""
   COMPOSE_VER_DISPLAY=""
   FULL_UI_PIPELINE=""
@@ -322,6 +363,8 @@ Options:
   --output MODE          quiet | verbose (legacy: standard → quiet; invalid → quiet)
   --confirm-steps        Prompt before each major step (TTY only; skipped with --yes)
   --no-color             Force plain output (same as STACK_UPDATER_COLOR=never)
+  --version, -V          Print version and exit
+  --stack NAME           Redeploy only this Portainer stack name (stacks phase)
   -h, --help             This help
 
 Defaults:
@@ -407,6 +450,19 @@ parse_cli() {
         NO_COLOR_CLI="true"
         shift
         ;;
+      --version | -V)
+        SHOW_VERSION="true"
+        shift
+        ;;
+      --stack)
+        if [[ -z "${2:-}" ]]; then
+          echo "ERROR: --stack requires a stack name" >&2
+          exit 2
+        fi
+        SINGLE_STACK_NAME="$2"
+        [[ ${#PHASE_QUEUE[@]} -eq 0 ]] && PHASE_QUEUE+=(stacks)
+        shift 2
+        ;;
       --phase)
         if [[ -z "${2:-}" ]]; then
           echo "ERROR: --phase requires an argument" >&2
@@ -426,6 +482,11 @@ parse_cli() {
 
 [[ $# -eq 0 ]] && EMPTY_INVOCATION="true"
 parse_cli "$@"
+
+if [[ "$SHOW_VERSION" == "true" ]]; then
+  printf 'stack-updater %s\n' "${STACK_UPDATER_VERSION}"
+  exit 0
+fi
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
   echo "Missing config file: $CONFIG_FILE" >&2
@@ -513,8 +574,12 @@ portainer_apply_release_stream() {
 portainer_apply_release_stream
 
 : "${PORTAINER_URL:?PORTAINER_URL is missing}"
-: "${PORTAINER_API_KEY:?PORTAINER_API_KEY is missing}"
 : "${ENDPOINT_ID:?ENDPOINT_ID is missing}"
+if [[ -z "${PORTAINER_API_KEY:-}" ]] && [[ ! -f "${PORTAINER_API_KEY_FILE:-}" ]]; then
+  echo "ERROR: PORTAINER_API_KEY or PORTAINER_API_KEY_FILE is required." >&2
+  exit 1
+fi
+build_curl_opts_and_auth
 
 # Cup HTTP timeouts / refresh (config may set; normalize booleans and numeric timeout).
 case "${CUP_REFRESH_BEFORE_CHECK,,}" in
@@ -538,8 +603,53 @@ case "${PORTAINER_USE_CUP_PRECHECK,,}" in
   *) PORTAINER_USE_CUP_PRECHECK="true" ;;
 esac
 
-CURL_OPTS=(--silent --show-error --fail --insecure)
-AUTH_HEADER=("X-API-Key: ${PORTAINER_API_KEY}")
+LOCK_FILE="${LOCK_FILE:-$SCRIPT_DIR/.stack-updater.lock}"
+
+case "${PORTAINER_TLS_VERIFY,,}" in
+  1 | true | yes) PORTAINER_TLS_VERIFY="true" ;;
+  *) PORTAINER_TLS_VERIFY="false" ;;
+esac
+
+case "${EXIT_WARNINGS_AS_FAILURE,,}" in
+  1 | true | yes) EXIT_WARNINGS_AS_FAILURE="true" ;;
+  *) EXIT_WARNINGS_AS_FAILURE="false" ;;
+esac
+
+case "${NOTIFY_ON_FAILURE,,}" in
+  0 | false | no) NOTIFY_ON_FAILURE="false" ;;
+  *) NOTIFY_ON_FAILURE="true" ;;
+esac
+case "${NOTIFY_ON_SUCCESS,,}" in
+  1 | true | yes) NOTIFY_ON_SUCCESS="true" ;;
+  *) NOTIFY_ON_SUCCESS="false" ;;
+esac
+
+LOG_MAX_BYTES="${LOG_MAX_BYTES:-5242880}"
+LOG_MAX_BYTES="${LOG_MAX_BYTES//[^0-9]/}"
+[[ -z "$LOG_MAX_BYTES" ]] && LOG_MAX_BYTES=0
+
+build_curl_opts_and_auth() {
+  CURL_OPTS=(--silent --show-error --fail)
+  if [[ "${PORTAINER_TLS_VERIFY:-false}" != "true" ]]; then
+    CURL_OPTS+=(--insecure)
+  elif [[ -n "${PORTAINER_CA_BUNDLE:-}" && -f "${PORTAINER_CA_BUNDLE}" ]]; then
+    CURL_OPTS+=(--cacert "$PORTAINER_CA_BUNDLE")
+  fi
+  local _pkey="${PORTAINER_API_KEY}"
+  if [[ -n "${PORTAINER_API_KEY_FILE:-}" && -f "${PORTAINER_API_KEY_FILE}" ]]; then
+    _pkey="$(tr -d '\r\n' <"${PORTAINER_API_KEY_FILE}")"
+  fi
+  AUTH_HEADER=(-H "X-API-Key: ${_pkey}")
+}
+
+_register_stack_updater_traps() {
+  [[ "$STACK_UPDATER_TRAP_REGISTERED" == "true" ]] && return 0
+  trap '_stack_updater_on_exit' EXIT
+  trap '_stack_updater_on_signal' INT TERM
+  trap '_err_trap' ERR
+  STACK_UPDATER_TRAP_REGISTERED="true"
+}
+_register_stack_updater_traps
 
 DOCKER_PKG_LIST=(
   docker-ce
@@ -1420,7 +1530,79 @@ log() {
   log_detail "$@"
 }
 
+mark_pipeline_hard_failure() {
+  PIPELINE_HARD_FAILURE=1
+}
+
+user_cancel_exit() {
+  USER_CANCELLED="true"
+  _emit_log_file_ts "Run cancelled by user."
+  exit 130
+}
+
+_mktemp_track() {
+  local f
+  f="$(mktemp)"
+  _TEMP_FILES+=("$f")
+  printf '%s' "$f"
+}
+
+_temp_cleanup() {
+  local f
+  for f in "${_TEMP_FILES[@]}"; do
+    rm -f "$f" 2>/dev/null || true
+  done
+  _TEMP_FILES=()
+}
+
+release_run_lock() {
+  [[ "$RUN_LOCK_ACQUIRED" != "true" ]] && return 0
+  flock -u "$LOCK_FD" 2>/dev/null || true
+  RUN_LOCK_ACQUIRED="false"
+}
+
+acquire_run_lock() {
+  [[ "${SKIP_RUN_LOCK:-false}" == "true" ]] && return 0
+  [[ "${SELF_TEST:-false}" == "true" ]] && return 0
+  [[ "$RUN_LOCK_ACQUIRED" == "true" ]] && return 0
+  LOCK_FILE="${LOCK_FILE:-$SCRIPT_DIR/.stack-updater.lock}"
+  eval "exec ${LOCK_FD}>\"${LOCK_FILE}\""
+  if ! flock -n "$LOCK_FD"; then
+    echo "ERROR: Another stack-updater run is in progress (lock: ${LOCK_FILE})." >&2
+    exit 75
+  fi
+  RUN_LOCK_ACQUIRED="true"
+}
+
+_stack_updater_on_exit() {
+  _temp_cleanup
+  release_run_lock
+}
+
+_stack_updater_on_signal() {
+  _emit_log_file_ts "Received signal; exiting."
+  exit 130
+}
+
+_err_trap() {
+  local ec=$? line cmd
+  line="${BASH_LINENO[0]:-?}"
+  cmd="${BASH_COMMAND:-?}"
+  _emit_log_file_ts "ERR trap: exit=${ec} line=${line} cmd=${cmd}"
+}
+
+rotate_log_if_needed() {
+  local maxb="${LOG_MAX_BYTES:-0}" sz
+  [[ "$maxb" -gt 0 ]] || return 0
+  [[ -f "${LOG_FILE:-}" ]] || return 0
+  sz="$(wc -c <"${LOG_FILE}" 2>/dev/null | tr -d ' ')" || return 0
+  [[ "${sz:-0}" -gt "$maxb" ]] || return 0
+  mv -f "${LOG_FILE}" "${LOG_FILE}.1" 2>/dev/null || true
+  : >"${LOG_FILE}" 2>/dev/null || true
+}
+
 fail() {
+  mark_pipeline_hard_failure
   _emit_log_file_ts "ERROR: $*"
   if _tty_ansi_ok && [[ "${OUTPUT_MODE:-quiet}" == "quiet" ]] && [[ "$CHECK_ONLY" != "true" ]]; then
     printf '%sERROR:%s %s\n' "$(tty_color red)" "$(tty_color reset)" "$*" >&2
@@ -1546,14 +1728,14 @@ confirm_step() {
   fi
   local msg="$1"
   if command -v gum >/dev/null 2>&1; then
-    gum confirm --default=false "$msg" || exit 0
+    gum confirm --default=false "$msg" || user_cancel_exit
     return 0
   fi
   local ans
-  read -r -p "$msg [y/N] " ans || exit 0
+  read -r -p "$msg [y/N] " ans || user_cancel_exit
   case "${ans,,}" in
     y | yes) return 0 ;;
-    *) exit 0 ;;
+    *) user_cancel_exit ;;
   esac
 }
 
@@ -1812,57 +1994,6 @@ init_selective_context() {
   fi
 }
 
-normalize_image_ref_token() {
-  echo "${1,,}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e 's/#.*$//'
-}
-
-compose_image_lines_from_content() {
-  local c="${1:-}"
-  echo "$c" | grep -iE '^[[:space:]]*image:[[:space:]]*' \
-    | sed -E 's/^[[:space:]]*image:[[:space:]]*//I' \
-    | sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' \
-    | sed '/^$/d' || true
-}
-
-# Digest suffixes are ignored when matching Cup references to compose image: lines.
-_cup_strip_digest() {
-  printf '%s' "${1}" | sed -E 's/@sha256:[a-f0-9]+//Ig'
-}
-
-_cup_registry_strip_leading() {
-  local r="${1,,}"
-  r="${r#docker.io/}"
-  r="${r#registry-1.docker.io/}"
-  printf '%s' "$r"
-}
-
-# Unqualified names (e.g. postgres) map to Docker Hub library/…
-_cup_library_expand() {
-  local r="$1"
-  [[ "$r" == */* ]] && printf '%s' "$r" && return 0
-  printf 'library/%s' "$r"
-}
-
-# True if compose image ref and Cup outdated reference describe the same image.
-_cup_image_refs_equivalent() {
-  local a b ra rb la lb
-  a="$(_cup_strip_digest "$(normalize_image_ref_token "${1:-}")")"
-  b="$(_cup_strip_digest "$(normalize_image_ref_token "${2:-}")")"
-  a="${a,,}"
-  b="${b,,}"
-  [[ -z "$a" || -z "$b" ]] && return 1
-  [[ "$a" == "$b" ]] && return 0
-  ra="$(_cup_registry_strip_leading "$a")"
-  rb="$(_cup_registry_strip_leading "$b")"
-  [[ "$ra" == "$rb" ]] && return 0
-  la="$(_cup_library_expand "$ra")"
-  lb="$(_cup_library_expand "$rb")"
-  [[ "$la" == "$lb" ]] && return 0
-  [[ "$ra" == "$lb" ]] && return 0
-  [[ "$la" == "$rb" ]] && return 0
-  return 1
-}
-
 cup_outdated_image_lines_from_json() {
   local json="${1:-}"
   [[ -z "$json" ]] && return 0
@@ -1904,18 +2035,19 @@ compose_images_match_cup_outdated() {
 }
 
 registry_digest_for_image_ref() {
-  docker manifest inspect "$1" 2>/dev/null | jq -r '
-    if .manifests then
-      (.manifests[0].digest // .manifests[].digest)
-    else
-      (.Descriptor.digest // .config.digest // empty)
-    end
-  ' 2>/dev/null | head -1
+  local manifest
+  manifest="$(docker manifest inspect "$1" 2>/dev/null)" || return 0
+  registry_digest_from_manifest_json "$manifest"
 }
 
 local_digest_for_image_ref() {
-  docker image inspect --format '{{index .RepoDigests 0}}' "$1" 2>/dev/null \
-    || docker image inspect --format '{{.Id}}' "$1" 2>/dev/null || echo ""
+  local rd
+  rd="$(docker image inspect --format '{{index .RepoDigests 0}}' "$1" 2>/dev/null || true)"
+  if [[ -n "$rd" && "$rd" == *@* ]]; then
+    printf '%s' "${rd#*@}"
+    return 0
+  fi
+  printf '%s' ""
 }
 
 # Sets global registry_selective_reason on first positive signal.
@@ -2075,28 +2207,10 @@ portainer_load_registry_digest_and_version() {
   _PORTAINER_REG_VERSION=""
   local manifest os arch d ver
   manifest="$(docker manifest inspect "$PORTAINER_IMAGE" 2>/dev/null)" || return 0
-  os="$(docker version -f '{{.Server.Os}}' 2>/dev/null || echo linux)"
-  arch="$(docker version -f '{{.Server.Arch}}' 2>/dev/null || echo "")"
-  [[ -z "$arch" ]] && arch="$(uname -m 2>/dev/null || echo amd64)"
-  case "$arch" in
-    aarch64) arch=arm64 ;;
-    x86_64) arch=amd64 ;;
-  esac
-  d="$(echo "$manifest" | jq -r --arg os "$os" --arg arch "$arch" '
-    if (.manifests | type) == "array" and (.manifests | length) > 0 then
-      ([
-        .manifests[]
-        | select(.platform != null and .platform.os == $os
-            and (.platform.architecture == $arch
-                 or ($arch == "arm64" and .platform.architecture == "arm" and .platform.variant == "v8")))
-      ] | first | .digest? // empty)
-    else
-      (.Descriptor.digest // .config.digest // empty)
-    end
-  ' 2>/dev/null)"
+  read -r os arch < <(docker_host_platform_os_arch)
+  d="$(registry_digest_from_manifest_json "$manifest")"
   if [[ -z "$d" ]] && echo "$manifest" | jq -e '.manifests | type == "array"' >/dev/null 2>&1; then
-    d="$(echo "$manifest" | jq -r '.manifests[0].digest? // empty' 2>/dev/null)"
-    log_detail "Portainer registry digest: no platform match for ${os}/${arch}; using first manifest list entry (degraded)."
+    log_detail "Portainer registry digest: no platform match for ${os}/${arch}; manifest list had no matching entry."
   fi
   _PORTAINER_REG_DIGEST="${d:-}"
   ver="$(echo "$manifest" | jq -r --arg os "$os" --arg arch "$arch" '
@@ -2132,29 +2246,6 @@ portainer_api_server_version() {
 
 portainer_image_label_version() {
   docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$PORTAINER_IMAGE" 2>/dev/null | tr -d '\r\n' || true
-}
-
-# Strip leading non-digits and trailing junk for sort -V (e.g. "2.39.1 LTS" -> "2.39.1").
-portainer_normalize_version_sortkey() {
-  local s="${1:-}"
-  s="${s#"${s%%[![:space:]]*}"}"
-  s="${s%%[[:space:]]*}"
-  s="${s#v}"
-  s="${s#V}"
-  s="${s#"${s%%[![:digit:].]*}"}"
-  printf '%s' "$s"
-}
-
-# Exit 0 if v1 >= v2 in sort -V order; 1 if v1 < v2; 2 if incomparable (empty after normalize).
-portainer_version_ge() {
-  local a b min
-  a="$(portainer_normalize_version_sortkey "${1:-}")"
-  b="$(portainer_normalize_version_sortkey "${2:-}")"
-  [[ -z "$a" || -z "$b" ]] && return 2
-  [[ "$a" == "$b" ]] && return 0
-  min="$(printf '%s\n' "$a" "$b" | sort -V | head -1)"
-  [[ "$min" == "$a" ]] && return 1
-  return 0
 }
 
 # Heuristic: docker prune output indicates nothing reclaimed (0B or blank).
@@ -2832,10 +2923,15 @@ redeploy_regular_stack() {
   local stack_json="$3"
 
   local tmp_json tmp_compose env_json
-  tmp_json="$(mktemp)"
-  tmp_compose="$(mktemp)"
+  tmp_json="$(_mktemp_track)"
+  tmp_compose="$(_mktemp_track)"
 
-  get_stack_file_content "$stack_id" >"$tmp_compose"
+  get_stack_file_content "$stack_id" >"$tmp_compose" || true
+  if [[ ! -s "$tmp_compose" ]] || [[ -z "$(tr -d '[:space:]' <"$tmp_compose")" ]]; then
+    log_warn "Compose content empty for stack ${stack_name} (id ${stack_id}); aborting redeploy."
+    rm -f "$tmp_json" "$tmp_compose"
+    return 1
+  fi
   env_json="$(build_env_json "$stack_json")"
 
   jq -n \
@@ -3031,7 +3127,7 @@ stack_post_redeploy_wait_for_group() {
     dependency)
       _emit_log_file_ts "[wait] ${stack_name} redeployed; dependency settle (container check + ${DEPENDENCY_SETTLE_SECONDS}s)"
       progress_child "Wait for service container: ${stack_name}"
-      wait_for_container_running "$stack_name" 300 || true
+      wait_for_compose_project_running "$stack_name" 300 || true
       log_detail "Giving dependency stack '${stack_name}' ${DEPENDENCY_SETTLE_SECONDS}s to settle..."
       progress_child "Settling after dependency stack: ${stack_name} (${DEPENDENCY_SETTLE_SECONDS}s)"
       sleep "$DEPENDENCY_SETTLE_SECONDS"
@@ -3087,6 +3183,56 @@ wait_for_container_running() {
   return 1
 }
 
+# Wait for all containers in a Compose project (label com.docker.compose.project).
+wait_for_compose_project_running() {
+  local stack_name="$1"
+  local timeout="${2:-300}"
+  local project waited=0 ids id state health n=0
+  project="$(compose_project_slug_from_stack_name "$stack_name")"
+  log_detail "Waiting for compose project '${project}' (stack ${stack_name}) containers to be running..."
+
+  while [[ "$waited" -lt "$timeout" ]]; do
+    mapfile -t ids < <(docker ps -aq --filter "label=com.docker.compose.project=${project}" 2>/dev/null || true)
+    n="${#ids[@]}"
+    if [[ "$n" -eq 0 ]]; then
+      if container_is_running "$stack_name"; then
+        log_step "container running: ${stack_name} (name match)"
+        return 0
+      fi
+      if [[ "$waited" -ge 15 ]]; then
+        log_warn "No compose project containers found for '${project}' (stack ${stack_name}); skipping long wait."
+        return 1
+      fi
+    else
+      local all_ok=1
+      for id in "${ids[@]}"; do
+        [[ -n "$id" ]] || continue
+        state="$(docker inspect -f '{{.State.Running}}' "$id" 2>/dev/null || echo false)"
+        health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$id" 2>/dev/null || echo none)"
+        if [[ "$state" != "true" ]]; then
+          all_ok=0
+          break
+        fi
+        if [[ "$health" == "unhealthy" ]]; then
+          all_ok=0
+          break
+        fi
+        if [[ "$health" == "starting" ]]; then
+          all_ok=0
+        fi
+      done
+      if [[ "$all_ok" -eq 1 ]]; then
+        log_step "compose project running: ${project} (${n} container(s))"
+        return 0
+      fi
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  log_warn "Timed out waiting for compose project '${project}' (stack ${stack_name})."
+  return 1
+}
+
 ########################################
 # HOST / DOCKER PACKAGE UPDATES
 ########################################
@@ -3116,10 +3262,11 @@ update_host_packages() {
     return 0
   fi
 
-  quiet_live "Host packages: refresh index…"
-  run_pkg_mgr update -y || log_warn "host package list refresh failed"
   quiet_live "Host packages: upgrade (may take a while)…"
-  run_pkg_mgr upgrade -y || log_warn "host package upgrade failed"
+  run_pkg_mgr upgrade -y || {
+    mark_pipeline_hard_failure
+    log_warn "host package upgrade failed"
+  }
   quiet_live "Host packages: autoremove…"
   run_pkg_mgr autoremove -y || log_warn "host package autoremove failed"
   quiet_live_clear
@@ -3154,7 +3301,10 @@ update_docker_packages() {
   quiet_live "Docker-related apt packages: upgrade…"
   run_pkg_mgr install -y --only-upgrade \
     "${DOCKER_PKG_LIST[@]}" \
-    || log_warn "Docker package upgrade failed"
+    || {
+      mark_pipeline_hard_failure
+      log_warn "Docker package upgrade failed"
+    }
 
   quiet_live_clear
   DOCKER_VER_DISPLAY="$(docker --version 2>/dev/null || echo 'Docker unavailable')"
@@ -3349,6 +3499,16 @@ deploy_remaining_non_heavy_stacks() {
 
 deploy_in_correct_order() {
   init_selective_context
+  if [[ -n "${SINGLE_STACK_NAME:-}" ]]; then
+    quiet_print_tree_banner_rule "STACK UPDATES"
+    log_step "single stack redeploy: ${SINGLE_STACK_NAME}"
+    compute_stack_deploy_total
+    redeploy_stack_by_name "$SINGLE_STACK_NAME" "remaining" || mark_pipeline_hard_failure
+    stack_post_redeploy_wait_for_group "$SINGLE_STACK_NAME" remaining
+    finish_progress
+    SUMMARY_PHASE_STACKS="completed"
+    return 0
+  fi
   compute_stack_deploy_total
   quiet_print_tree_banner_rule "STACK UPDATES"
   progress_child "Deploy stacks: dependencies → dependents → heavy → remaining"
@@ -3407,7 +3567,7 @@ portainer_docker_pull_image() {
     return "$ec"
   fi
   quiet_live "docker pull ${PORTAINER_IMAGE}…"
-  tmp="$(mktemp)"
+  tmp="$(_mktemp_track)"
   if docker pull "$PORTAINER_IMAGE" >>"$tmp" 2>&1; then
     quiet_live_clear
     rm -f "$tmp"
@@ -3429,6 +3589,131 @@ portainer_docker_pull_image() {
     _emit_log_tty "WARNING: Portainer image check failed; keeping existing container (see ${LOG_FILE})."
   fi
   return "$ec"
+}
+
+# True when inspect JSON shows non-standard Portainer layout (extra mounts, networks, labels).
+portainer_inspect_has_divergence() {
+  local f="$1"
+  [[ -f "$f" ]] || return 1
+  local nmount
+  nmount="$(jq -r '.[0].Mounts | length // 0' "$f" 2>/dev/null)"
+  [[ "${nmount:-0}" -gt 3 ]] && return 0
+  if jq -e '.[0].Mounts[]? | select(.Destination=="/data") | select(.Type=="volume") | select(.Name != "portainer_data" and .Name != null)' "$f" >/dev/null 2>&1; then
+    return 0
+  fi
+  local nm
+  nm="$(jq -r '.[0].HostConfig.NetworkMode // "default"' "$f" 2>/dev/null)"
+  [[ "$nm" != "default" && "$nm" != "bridge" && -n "$nm" ]] && return 0
+  local extra_lbl
+  extra_lbl="$(jq -r '.[0].Config.Labels // {} | keys[]' "$f" 2>/dev/null | grep -vcE '^(com\.docker|org\.opencontainers|io\.portainer)' || true)"
+  [[ "${extra_lbl:-0}" -gt 0 ]] && return 0
+  return 1
+}
+
+portainer_divergence_gate() {
+  local f="$1"
+  portainer_inspect_has_divergence "$f" || return 0
+  log_warn "Portainer container has non-standard config (extra mounts, networks, or labels). Recreate may change behavior."
+  case "${PORTAINER_RECREATE_ACK_DIVERGENCE:-false}" in
+    1 | true | yes) return 0 ;;
+  esac
+  if [[ -t 0 ]] && [[ "$AUTO_YES" != "true" ]]; then
+    if command -v gum >/dev/null 2>&1; then
+      gum confirm "Proceed with non-standard Portainer recreate?" --default=false || return 1
+      return 0
+    fi
+    local ans
+    read -r -p "Proceed with non-standard Portainer recreate? [y/N] " ans || return 1
+    case "${ans,,}" in y | yes) return 0 ;; *) return 1 ;; esac
+  fi
+  log_warn "Set PORTAINER_RECREATE_ACK_DIVERGENCE=1 to allow non-interactive recreate."
+  return 1
+}
+
+# Build docker run -d argv from inspect; last element is image ref (caller may override).
+portainer_build_run_args_from_inspect() {
+  local inspect_file="$1"
+  local -n _out=$2
+  _out=()
+  local restart
+  restart="$(jq -r '.[0].HostConfig.RestartPolicy.Name // "always"' "$inspect_file" 2>/dev/null)"
+  [[ "$restart" == "no" || -z "$restart" ]] && restart="always"
+  _out+=(--name "$PORTAINER_CONTAINER_NAME" --restart="$restart")
+  local hp cp has9443=0
+  while IFS= read -r hp cp; do
+    [[ -z "$hp" || -z "$cp" ]] && continue
+    _out+=(-p "${hp}:${cp}")
+    [[ "$hp" == "9443" && "$cp" == "9443" ]] && has9443=1
+  done < <(jq -r '
+    .[0].HostConfig.PortBindings // {}
+    | to_entries[]
+    | "\(.value[0].HostPort // "") \(.key | split("/")[0])"
+  ' "$inspect_file" 2>/dev/null)
+  [[ "$has9443" -eq 0 ]] && _out+=(-p "9443:9443")
+  [[ "${PORTAINER_ENABLE_EDGE_PORT:-true}" == "true" ]] && _out+=(-p "8000:8000")
+  [[ "${PORTAINER_ENABLE_LEGACY_HTTP_PORT:-false}" == "true" ]] && _out+=(-p "9000:9000")
+  local mspec
+  while IFS= read -r mspec; do
+    [[ -n "$mspec" ]] && _out+=(-v "$mspec")
+  done < <(jq -r '
+    .[0].Mounts[]?
+    | if .Type == "volume" and .Name then "\(.Name):\(.Destination)"
+      elif .Source then "\(.Source):\(.Destination)"
+      else empty end
+  ' "$inspect_file" 2>/dev/null)
+  if ! printf '%s\n' "${_out[@]}" | grep -q 'docker.sock'; then
+    _out+=(-v /var/run/docker.sock:/var/run/docker.sock)
+  fi
+  if ! printf '%s\n' "${_out[@]}" | grep -q 'portainer_data'; then
+    _out+=(-v portainer_data:/data)
+  fi
+  _out+=("$PORTAINER_IMAGE")
+}
+
+portainer_rollback_from_backup() {
+  local backup="$1" new="$PORTAINER_CONTAINER_NAME"
+  log_detail "Rolling back Portainer: removing failed new container and restoring ${backup}."
+  run_docker stop "$new" 2>/dev/null || true
+  run_docker rm -f "$new" 2>/dev/null || true
+  run_docker rename "$backup" "$new" 2>/dev/null || true
+  run_docker start "$new" 2>/dev/null || true
+  log_warn "Portainer rolled back to previous container (${new})."
+}
+
+portainer_recreate_rollback_safe() {
+  local backup="${PORTAINER_CONTAINER_NAME}_su_old"
+  local inspect_tmp
+  local -a run_args=()
+  inspect_tmp="$(_mktemp_track)"
+  docker inspect "$PORTAINER_CONTAINER_NAME" >"$inspect_tmp" 2>/dev/null || fail "Cannot inspect Portainer container ${PORTAINER_CONTAINER_NAME}"
+
+  if ! portainer_divergence_gate "$inspect_tmp"; then
+    SUMMARY_PHASE_PORTAINER="skipped_config_divergence"
+    return 0
+  fi
+
+  portainer_build_run_args_from_inspect "$inspect_tmp" run_args
+  log_detail "Planned Portainer recreate: docker run -d ${run_args[*]}"
+
+  log_detail "Stopping and renaming ${PORTAINER_CONTAINER_NAME} -> ${backup} (rollback-safe)."
+  run_docker stop "$PORTAINER_CONTAINER_NAME" || true
+  sleep 2
+  run_docker rename "$PORTAINER_CONTAINER_NAME" "$backup" || fail "Portainer rename for rollback failed"
+
+  if ! run_docker run -d "${run_args[@]}"; then
+    portainer_rollback_from_backup "$backup"
+    mark_pipeline_hard_failure
+    fail "Portainer redeploy failed; rolled back to previous container"
+  fi
+
+  if ! wait_for_portainer_api 180; then
+    portainer_rollback_from_backup "$backup"
+    mark_pipeline_hard_failure
+    fail "Portainer API unavailable after recreate; rolled back to previous container"
+  fi
+
+  run_docker rm -f "$backup" 2>/dev/null || true
+  log_detail "Portainer recreate succeeded; removed backup container ${backup}."
 }
 
 wait_for_portainer_api() {
@@ -3571,30 +3856,7 @@ update_portainer_container_if_enabled() {
     print_info 2 "$(_leg_icon update_available) Portainer image: update available"
   fi
   portainer_quiet_ui_container_begin
-
-  log_detail "Stopping Portainer container..."
-  run_docker stop "$PORTAINER_CONTAINER_NAME" || true
-  sleep 5
-
-  log_detail "Removing old Portainer container. Volume is preserved."
-  run_docker rm "$PORTAINER_CONTAINER_NAME" || true
-  sleep 5
-
-  log_detail "Recreating Portainer with existing portainer_data volume..."
-  local -a pub_rec=()
-  pub_rec+=(-p "9443:9443")
-  [[ "${PORTAINER_ENABLE_EDGE_PORT:-true}" == "true" ]] && pub_rec+=(-p "8000:8000")
-  [[ "${PORTAINER_ENABLE_LEGACY_HTTP_PORT:-false}" == "true" ]] && pub_rec+=(-p "9000:9000")
-  run_docker run -d \
-    --name "$PORTAINER_CONTAINER_NAME" \
-    --restart=always \
-    "${pub_rec[@]}" \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -v portainer_data:/data \
-    "$PORTAINER_IMAGE" \
-    || fail "Portainer redeploy failed"
-
-  wait_for_portainer_api 180
+  portainer_recreate_rollback_safe
   SUMMARY_PHASE_PORTAINER="ran"
 }
 
@@ -3619,7 +3881,11 @@ cleanup_docker() {
   if [[ "$PRUNE_UNUSED_IMAGES" == "true" ]]; then
     log_detail "Pruning unused images only. Volumes are untouched."
     local imo
-    imo="$(run_docker image prune -af 2>&1)" || true
+    if [[ -n "${PRUNE_IMAGES_UNTIL:-}" ]]; then
+      imo="$(run_docker image prune -af --filter "until=${PRUNE_IMAGES_UNTIL}" 2>&1)" || true
+    else
+      imo="$(run_docker image prune -af 2>&1)" || true
+    fi
     [[ -n "$imo" ]] && log_detail "docker image prune output (tail): $(echo "$imo" | tail -3)"
     CLEANUP_IMAGE_SUMMARY="$(printf '%s\n' "$imo" | grep -i 'Total reclaimed' | tail -n 1 | sed 's/^[[:space:]]*//' || true)"
     [[ -z "$CLEANUP_IMAGE_SUMMARY" ]] && CLEANUP_IMAGE_SUMMARY="$(printf '%s\n' "$imo" | grep -i 'deleted' | tail -n 1 | sed 's/^[[:space:]]*//' || true)"
@@ -3702,14 +3968,14 @@ confirm_tui_action() {
   local summary="$1"
   [[ "$AUTO_YES" == "true" ]] && return 0
   if command -v gum >/dev/null 2>&1; then
-    gum confirm --default=false "$summary" || exit 0
+    gum confirm --default=false "$summary" || user_cancel_exit
     return 0
   fi
   local ans
-  read -r -p "$summary [y/N] " ans || exit 0
+  read -r -p "$summary [y/N] " ans || user_cancel_exit
   case "${ans,,}" in
     y | yes) return 0 ;;
-    *) exit 0 ;;
+    *) user_cancel_exit ;;
   esac
 }
 
@@ -3787,8 +4053,6 @@ run_tui_expert_pipeline_shell() {
   case "${yn,,}" in y | yes) SKIP_HOST_IF_NONE="true" ;; esac
   read -r -p "SKIP Docker pkgs if nothing? [y/N]: " yn || true
   case "${yn,,}" in y | yes) SKIP_DOCKER_PKGS_IF_NONE="true" ;; esac
-  read -r -p "Legacy SKIP Portainer digest flag (unused)? [y/N]: " yn || true
-  case "${yn,,}" in y | yes) SKIP_PORTAINER_PULL_IF_CURRENT="true" ;; esac
   read -r -p "SKIP stack phase if Cup reports 0 outdated? [y/N]: " yn || true
   case "${yn,,}" in y | yes) SKIP_STACK_PHASE_IF_CUP_CLEAN="true" ;; esac
   read -r -p "SKIP cleanup when stacks skipped (Cup gate)? [Y/n]: " yn || true
@@ -3819,7 +4083,7 @@ run_tui_expert_gum() {
   preset="$(gum choose --header "Pipeline & skip behavior (session)" \
     "Full script defaults (typical homelab)" \
     "Enable selective stack redeploy (Cup / digest)" \
-    "Enable skip-if-clean (host, Docker pkgs; legacy Portainer digest flag)" \
+    "Enable skip-if-clean (host, Docker pkgs when nothing to upgrade)" \
     "Skip stack phase when Cup reports zero image updates" \
     "Prompt before Portainer stack redeploys" \
     "Expert: set each flag" \
@@ -3832,7 +4096,6 @@ run_tui_expert_gum() {
     *skip-if-clean*)
       SKIP_HOST_IF_NONE="true"
       SKIP_DOCKER_PKGS_IF_NONE="true"
-      SKIP_PORTAINER_PULL_IF_CURRENT="true"
       ;;
     *Cup\ reports*)
       SKIP_STACK_PHASE_IF_CUP_CLEAN="true"
@@ -3855,6 +4118,215 @@ run_tui_expert_options() {
   return 0
 }
 
+SCHEDULE_CRON_MARKER="# stack-updater-managed"
+SCHEDULE_SYSTEMD_MARKER="stack-updater-managed"
+
+_stack_updater_script_abs() {
+  printf '%s/stack-updater.sh' "$SCRIPT_DIR"
+}
+
+_stack_updater_cron_line() {
+  local sched="$1" out quiet
+  out="${OUTPUT_MODE:-quiet}"
+  quiet="${2:-quiet}"
+  [[ -n "$quiet" ]] && out="$quiet"
+  printf '%s\n' "${SCHEDULE_CRON_MARKER}"
+  printf 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n'
+  printf 'CONFIG_FILE=%s LOG_FILE=%s\n' "$CONFIG_FILE" "${LOG_FILE:-$SCRIPT_DIR/stack-updater.log}"
+  printf '%s flock -n %s %s --batch --yes --output %s\n' \
+    "$sched" "${LOCK_FILE:-$SCRIPT_DIR/.stack-updater.lock}" \
+    "$(_stack_updater_script_abs)" "$out"
+}
+
+_schedule_preset_to_cron() {
+  case "$1" in
+    daily_0400) printf '%s' '0 4 * * *' ;;
+    weekly_sun_0400) printf '%s' '0 4 * * 0' ;;
+    monthly_1st_0400) printf '%s' '0 4 1 * *' ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+_schedule_preset_to_systemd_calendar() {
+  case "$1" in
+    daily_0400) printf '%s' '*-*-* 04:00:00' ;;
+    weekly_sun_0400) printf '%s' 'Sun *-*-* 04:00:00' ;;
+    monthly_1st_0400) printf '%s' '*-*-01 04:00:00' ;;
+    *) printf '%s' '*-*-* 04:00:00' ;;
+  esac
+}
+
+_show_managed_cron_schedule() {
+  local cr
+  if ! cr="$(crontab -l 2>/dev/null)"; then
+    printf '%s\n' "No user crontab or crontab unavailable."
+    return 0
+  fi
+  if grep -q "${SCHEDULE_CRON_MARKER}" <<<"$cr"; then
+    printf '%s\n' "--- Managed cron entries ---"
+    awk -v m="$SCHEDULE_CRON_MARKER" '$0 ~ m || f {print; f=($0 ~ m)}' <<<"$cr"
+  else
+    printf '%s\n' "No managed cron entry (${SCHEDULE_CRON_MARKER})."
+  fi
+}
+
+_show_managed_systemd_schedule() {
+  local unit="/etc/systemd/system/stack-updater.timer"
+  if [[ -f "$unit" ]]; then
+    printf '%s\n' "--- stack-updater.timer ---"
+    cat "$unit"
+    [[ -f /etc/systemd/system/stack-updater.service ]] && printf '\n%s\n' "--- stack-updater.service ---" && cat /etc/systemd/system/stack-updater.service
+  else
+    printf '%s\n' "No systemd timer at ${unit}"
+  fi
+}
+
+_install_managed_cron() {
+  local sched="$1" line existing tmp
+  sched="$(_schedule_preset_to_cron "$sched")"
+  stack_updater_cron_valid "$sched" || fail "Invalid cron schedule: ${sched}"
+  line="$(_stack_updater_cron_line "$sched")"
+  existing="$(crontab -l 2>/dev/null | grep -v "${SCHEDULE_CRON_MARKER}" | grep -v 'stack-updater.sh' | grep -v 'flock -n.*stack-updater' || true)"
+  tmp="$(_mktemp_track)"
+  { printf '%s\n' "$existing"; printf '%s\n' "$line"; } >"$tmp"
+  printf '%s\n' "Will install crontab entry:"
+  printf '%s\n' "$line"
+  confirm_menu_action_unless_stepping "Install/update root/user crontab with the line above?"
+  crontab "$tmp"
+  printf '%s\n' "Cron schedule installed."
+}
+
+_install_managed_systemd() {
+  local preset="$1" cal svc timer
+  cal="$(_schedule_preset_to_systemd_calendar "$preset")"
+  svc="/etc/systemd/system/stack-updater.service"
+  timer="/etc/systemd/system/stack-updater.timer"
+  printf '%s\n' "Will write ${svc} and ${timer} (requires root)."
+  confirm_menu_action_unless_stepping "Install systemd timer (${cal})?"
+  sudo tee "$svc" >/dev/null <<EOF
+[Unit]
+Description=${SCHEDULE_SYSTEMD_MARKER} Stack Updater
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=CONFIG_FILE=${CONFIG_FILE}
+Environment=LOG_FILE=${LOG_FILE:-$SCRIPT_DIR/stack-updater.log}
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/usr/bin/flock -n ${LOCK_FILE:-$SCRIPT_DIR/.stack-updater.lock} $(_stack_updater_script_abs) --batch --yes --output quiet
+EOF
+  sudo tee "$timer" >/dev/null <<EOF
+[Unit]
+Description=${SCHEDULE_SYSTEMD_MARKER} Stack Updater timer
+
+[Timer]
+OnCalendar=${cal}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now stack-updater.timer
+  printf '%s\n' "Systemd timer enabled."
+}
+
+_remove_managed_cron() {
+  local existing tmp
+  existing="$(crontab -l 2>/dev/null | grep -v "${SCHEDULE_CRON_MARKER}" | grep -v 'stack-updater.sh' | grep -v 'flock -n.*stack-updater' || true)"
+  tmp="$(_mktemp_track)"
+  printf '%s' "$existing" >"$tmp"
+  crontab "$tmp" 2>/dev/null || crontab -r 2>/dev/null || true
+  printf '%s\n' "Removed managed cron entries."
+}
+
+_remove_managed_systemd() {
+  sudo systemctl disable --now stack-updater.timer 2>/dev/null || true
+  sudo rm -f /etc/systemd/system/stack-updater.service /etc/systemd/system/stack-updater.timer
+  sudo systemctl daemon-reload 2>/dev/null || true
+  printf '%s\n' "Removed stack-updater systemd units."
+}
+
+_pick_schedule_preset() {
+  local p
+  if command -v gum >/dev/null 2>&1; then
+    p="$(gum choose --header "Schedule preset" \
+      "daily_0400" "weekly_sun_0400" "monthly_1st_0400" "custom_cron" "Back")" || p=""
+    [[ "$p" == "Back" || -z "$p" ]] && return 1
+    if [[ "$p" == "custom_cron" ]]; then
+      p="$(gum input --placeholder "0 4 * * *" --header "5-field cron expression")" || return 1
+    fi
+    printf '%s' "$p"
+    return 0
+  fi
+  echo " 1) Daily 04:00  2) Weekly Sun 04:00  3) Monthly 1st 04:00  4) Custom cron  5) Back" >&2
+  read -r -p "Preset [1-5]: " p || return 1
+  case "$p" in
+    1) printf '%s' 'daily_0400' ;;
+    2) printf '%s' 'weekly_sun_0400' ;;
+    3) printf '%s' 'monthly_1st_0400' ;;
+    4) read -r -p "Cron expression: " p && printf '%s' "$p" ;;
+    *) return 1 ;;
+  esac
+}
+
+manage_scheduled_runs() {
+  local action backend preset
+  if command -v gum >/dev/null 2>&1; then
+    action="$(gum choose --header "Manage scheduled runs" \
+      "Install/update schedule" "Show current schedule" "Remove schedule" "Back")" || action=""
+  else
+    echo " 1) Install/update  2) Show  3) Remove  4) Back" >&2
+    read -r -p "Choice: " action || action=""
+    case "$action" in
+      1) action="Install/update schedule" ;;
+      2) action="Show current schedule" ;;
+      3) action="Remove schedule" ;;
+      *) action="Back" ;;
+    esac
+  fi
+  [[ -z "$action" || "$action" == "Back" ]] && return 0
+  case "$action" in
+    "Show current schedule")
+      _show_managed_cron_schedule
+      _show_managed_systemd_schedule
+      return 0
+      ;;
+    "Remove schedule")
+      if command -v gum >/dev/null 2>&1; then
+        backend="$(gum choose "cron" "systemd" "both")" || backend=""
+      else
+        read -r -p "Remove cron, systemd, or both? " backend || backend=""
+      fi
+      case "${backend,,}" in
+        cron) _remove_managed_cron ;;
+        systemd) _remove_managed_systemd ;;
+        *) _remove_managed_cron; _remove_managed_systemd ;;
+      esac
+      return 0
+      ;;
+  esac
+  if command -v gum >/dev/null 2>&1; then
+    backend="$(gum choose --header "Scheduler backend (equal choice)" "cron" "systemd")" || backend=""
+  else
+    read -r -p "Backend (cron/systemd): " backend || backend=""
+  fi
+  [[ -z "$backend" ]] && return 0
+  preset="$(_pick_schedule_preset)" || return 0
+  case "${backend,,}" in
+    systemd)
+      if [[ ! -d /run/systemd/system ]] && [[ ! -d /run/systemd ]]; then
+        log_warn "systemd does not appear to be PID 1; consider cron for LXC/minimal containers."
+      fi
+      _install_managed_systemd "$preset"
+      ;;
+    *)
+      _install_managed_cron "$preset"
+      ;;
+  esac
+}
+
 _pick_action_menu_choice() {
   local hdr choice_raw
   hdr=$'Portainer stack updater — select action\nPhase actions may show more diagnostic output.'
@@ -3869,6 +4341,7 @@ _pick_action_menu_choice() {
       "Phase: Cup diagnostics" \
       "Phase: Stacks" \
       "Phase: Docker cleanup" \
+      "Manage scheduled runs" \
       "Expert/session options" \
       "Exit")" || choice_raw=""
     printf '%s' "${choice_raw:-}"
@@ -3878,8 +4351,8 @@ _pick_action_menu_choice() {
   echo "  1) Report only (no changes)     2) Run full update (all phases)    3) Dry-run full update (log only)" >&2
   echo "  4) Phase: Host packages         5) Phase: Docker packages          6) Phase: Portainer container" >&2
   echo "  7) Phase: Cup diagnostics       8) Phase: Stacks                   9) Phase: Docker cleanup" >&2
-  echo " 10) Expert/session options      11) Exit" >&2
-  read -r -p "Choice [1-11]: " choice_raw || choice_raw=""
+  echo " 10) Manage scheduled runs      11) Expert/session options      12) Exit" >&2
+  read -r -p "Choice [1-12]: " choice_raw || choice_raw=""
   case "${choice_raw:-}" in
     1) printf '%s' "Report only (no changes)" ;;
     2) printf '%s' "Run full update (all phases)" ;;
@@ -3890,8 +4363,9 @@ _pick_action_menu_choice() {
     7) printf '%s' "Phase: Cup diagnostics" ;;
     8) printf '%s' "Phase: Stacks" ;;
     9) printf '%s' "Phase: Docker cleanup" ;;
-    10) printf '%s' "Expert/session options" ;;
-    11 | "") printf '%s' "Exit" ;;
+    10) printf '%s' "Manage scheduled runs" ;;
+    11) printf '%s' "Expert/session options" ;;
+    12 | "") printf '%s' "Exit" ;;
     *) printf '%s' "Exit" ;;
   esac
 }
@@ -3905,7 +4379,6 @@ _run_tui_pipeline_expert_gum() {
   gum confirm "Prune unused Docker volumes? (unused only; can delete data if volumes become unused)" --default=false && PRUNE_UNUSED_VOLUMES="true" || PRUNE_UNUSED_VOLUMES="false"
   gum confirm "SKIP host apt when dry-run sim shows nothing?" --default=false && SKIP_HOST_IF_NONE="true" || SKIP_HOST_IF_NONE="false"
   gum confirm "SKIP Docker pkgs when sim shows nothing?" --default=false && SKIP_DOCKER_PKGS_IF_NONE="true" || SKIP_DOCKER_PKGS_IF_NONE="false"
-  gum confirm "Set legacy SKIP Portainer digest flag (unused today)?" --default=false && SKIP_PORTAINER_PULL_IF_CURRENT="true" || SKIP_PORTAINER_PULL_IF_CURRENT="false"
   gum confirm "SKIP entire stacks phase when Cup reports 0 outdated?" --default=false && SKIP_STACK_PHASE_IF_CUP_CLEAN="true" || SKIP_STACK_PHASE_IF_CUP_CLEAN="false"
   gum confirm "SKIP cleanup when stacks phase skipped (Cup gate)?" --default=true && SKIP_CLEANUP_IF_STACKS_SKIPPED="true" || SKIP_CLEANUP_IF_STACKS_SKIPPED="false"
   gum confirm "Prompt before Portainer stack redeploys?" --default=false && STACK_UPDATE_PROMPT="true" || STACK_UPDATE_PROMPT="false"
@@ -3928,6 +4401,10 @@ run_tui_menu() {
     case "$choice" in
       "Exit")
         exit 0
+        ;;
+      "Manage scheduled runs")
+        manage_scheduled_runs || true
+        continue
         ;;
       "Expert/session options")
         run_tui_expert_options || true
@@ -4015,14 +4492,35 @@ maybe_cleanup_after_stack_phase() {
   }
 }
 
-_format_duration_secs() {
-  local secs="${1:-0}" m s
-  m=$((secs / 60))
-  s=$((secs % 60))
-  if [[ "$m" -gt 0 ]]; then
-    printf '%dm %ds' "$m" "$s"
+_pipeline_had_updates() {
+  [[ "${#STACKS_REDEPLOYED[@]}" -gt 0 ]] && return 0
+  [[ "${SUMMARY_PHASE_HOST:-}" == "ran" ]] && return 0
+  [[ "${SUMMARY_PHASE_DOCKER_PKGS:-}" == "ran" ]] && return 0
+  [[ "${SUMMARY_PHASE_PORTAINER:-}" == "ran" ]] && return 0
+  return 1
+}
+
+run_stack_updater_notifications() {
+  local status summary nf send=0
+  nf="$(_count_redeploy_failed_in_notes)"
+  if [[ "${nf:-0}" -gt 0 || "${PIPELINE_HARD_FAILURE:-0}" -eq 1 ]]; then
+    status="failure"
+    [[ "${NOTIFY_ON_FAILURE:-true}" == "true" ]] && send=1
   else
-    printf '%ds' "$s"
+    status="success"
+    [[ "${NOTIFY_ON_SUCCESS:-false}" == "true" ]] && _pipeline_had_updates && send=1
+  fi
+  [[ "$send" -eq 1 ]] || return 0
+  summary="stacks_redeployed=${#STACKS_REDEPLOYED[@]} warnings=${RUN_WARNING_COUNT:-0}"
+  export STACK_UPDATER_STATUS="$status" STACK_UPDATER_SUMMARY="$summary" LOG_FILE
+  if [[ -n "${NOTIFY_COMMAND:-}" ]]; then
+    bash -c "${NOTIFY_COMMAND}" 2>/dev/null || log_warn "NOTIFY_COMMAND failed"
+  fi
+  if [[ -n "${NOTIFY_WEBHOOK_URL:-}" ]]; then
+    curl -sS --max-time 15 -X POST "${NOTIFY_WEBHOOK_URL}" \
+      -H 'Content-Type: application/json' \
+      -d "{\"title\":\"Stack Updater\",\"message\":\"${status}: ${summary}\",\"status\":\"${status}\"}" \
+      >/dev/null 2>&1 || log_warn "NOTIFY_WEBHOOK_URL POST failed"
   fi
 }
 
@@ -4086,6 +4584,11 @@ print_run_summary() {
 
   LAST_PIPELINE_EXIT_CODE=0
   [[ "${nf:-0}" -gt 0 ]] && LAST_PIPELINE_EXIT_CODE=1
+  [[ "${PIPELINE_HARD_FAILURE:-0}" -eq 1 ]] && LAST_PIPELINE_EXIT_CODE=1
+  if [[ "${EXIT_WARNINGS_AS_FAILURE:-false}" == "true" ]] && [[ "${RUN_WARNING_COUNT:-0}" -gt 0 ]]; then
+    LAST_PIPELINE_EXIT_CODE=1
+  fi
+  run_stack_updater_notifications
 
   if _quiet_tree_tty; then
     printf '\n'
@@ -4266,6 +4769,8 @@ run_phases_list() {
 
   [[ "${#phases[@]}" -eq 0 ]] && return 0
 
+  acquire_run_lock
+  rotate_log_if_needed
   reset_phases_list_summaries
   quiet_live_clear_safe
   PIPELINE_START_EPOCH="$(date +%s)"
@@ -4368,6 +4873,8 @@ run_phases_list() {
 
 execute_full_pipeline() {
   local _t
+  acquire_run_lock
+  rotate_log_if_needed
   reset_full_pipeline_summaries
   FULL_UI_PIPELINE="true"
   quiet_live_clear_safe
@@ -4467,6 +4974,12 @@ run_self_test() {
     printf '%-8s %s\n' PASS "bash -n stack-updater.sh"
   else
     printf '%-8s %s\n' FAIL "bash -n stack-updater.sh"
+    fails=$((fails + 1))
+  fi
+  if [[ -f "$SCRIPT_DIR/lib/stack-updater-core.sh" ]] && bash -n "$SCRIPT_DIR/lib/stack-updater-core.sh" 2>/dev/null; then
+    printf '%-8s %s\n' PASS "bash -n lib/stack-updater-core.sh"
+  else
+    printf '%-8s %s\n' FAIL "lib/stack-updater-core.sh missing or syntax error"
     fails=$((fails + 1))
   fi
   if [[ -f "${CONFIG_FILE:-}" ]] && bash -n "$CONFIG_FILE" 2>/dev/null; then

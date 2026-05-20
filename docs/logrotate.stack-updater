@@ -1,0 +1,11 @@
+# Optional logrotate snippet for Stack Updater (install to /etc/logrotate.d/stack-updater)
+# Adjust path to match LOG_FILE in config.env
+
+/opt/scripts/Stack-Updater/stack-updater.log {
+    weekly
+    rotate 4
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
