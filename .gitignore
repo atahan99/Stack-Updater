@@ -5,5 +5,8 @@ config.env
 # Logs
 *.log
 
+# Runtime lock (single-instance)
+.stack-updater.lock
+
 # OS / editor
 .DS_Store
