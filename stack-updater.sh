@@ -1544,18 +1544,82 @@ user_cancel_exit() {
 # True for SIGINT (Ctrl+C) and common terminal interrupt codes from gum.
 _gum_exit_is_interrupt() {
   local ec="${1:-$?}"
-  [[ "$ec" -eq 130 || "$ec" -eq 2 ]]
+  [[ "$ec" -eq 130 || "$ec" -eq 143 || "$ec" -eq 2 ]]
 }
 
-# gum choose: any failure (including Ctrl+C) exits the script; never fall back to a default option.
+# Count positional choices in gum choose argv (excludes flags like --header).
+_gum_choose_count_items() {
+  local n=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --header | --height | --selected | --cursor | --selected-prefix | --unselected-prefix | --cursor-prefix)
+        shift 2
+        ;;
+      --* )
+        shift
+        ;;
+      *)
+        n=$((n + 1))
+        shift
+        ;;
+    esac
+  done
+  printf '%s' "$n"
+}
+
+_gum_choose_has_height_flag() {
+  while [[ $# -gt 0 ]]; do
+    [[ "$1" == "--height" ]] && return 0
+    shift
+  done
+  return 1
+}
+
+# gum choose: Ctrl+C / Esc cancel must exit the script (not fall through as empty choice).
+# Avoid bare command substitution: some gum builds return 0 with empty output on interrupt.
+# gum defaults to --height 10, which paginates long menus (e.g. Exit on page 2); size to item count.
 _gum_choose_or_exit() {
-  local ec=0 out
+  local ec=0 out tmp n height=0
+  local -a choose_args=()
   _tui_screen_reset
-  out="$(gum choose "$@")" || ec=$?
-  if [[ "$ec" -ne 0 ]]; then
+  tmp="$(_mktemp_track)"
+  if ! _gum_choose_has_height_flag "$@"; then
+    n="$(_gum_choose_count_items "$@")"
+    [[ "$n" -gt 0 ]] && height=$((n + 2))
+    [[ "$height" -gt 0 ]] && choose_args=(--height "$height")
+  fi
+  set +e
+  gum choose "${choose_args[@]}" "$@" >"$tmp"
+  ec=$?
+  set -e
+  out="$(cat "$tmp" 2>/dev/null || true)"
+  if [[ "$ec" -ne 0 ]] || _gum_exit_is_interrupt "$ec" || [[ -z "${out//[[:space:]]/}" ]]; then
     user_cancel_exit
   fi
   printf '%s' "$out"
+}
+
+# Yes/No via choose so Ctrl+C always exits (confirm maps Ctrl+C to "No", exit 1).
+_gum_choose_yes_no() {
+  local hdr="$1" default_yes="${2:-false}" pick ylabel nlabel
+  if [[ "$default_yes" == true ]]; then
+    ylabel="Yes (default)"
+    nlabel="No"
+  else
+    ylabel="Yes"
+    nlabel="No (default)"
+  fi
+  pick="$(_gum_choose_or_exit --header "$hdr" "$ylabel" "$nlabel")"
+  [[ "$pick" == *Yes* ]]
+}
+
+# Acknowledge-only; any non-zero (including Ctrl+C) exits the script.
+_gum_ack_or_exit() {
+  local ec=0
+  _tui_screen_reset
+  gum confirm "$@" || ec=$?
+  _tui_screen_reset
+  [[ "$ec" -eq 0 ]] || user_cancel_exit
 }
 
 # gum confirm: Ctrl+C exits; decline (exit 1) is returned to the caller.
@@ -1567,6 +1631,25 @@ _gum_confirm_or_interrupt() {
     user_cancel_exit
   fi
   return "$ec"
+}
+
+_gum_pager_or_interrupt() {
+  local ec=0 content="$1"
+  _tui_screen_reset
+  printf '%s\n' "$content" | gum pager --soft-wrap 2>/dev/null || ec=$?
+  _tui_screen_reset
+  if [[ "$ec" -ne 0 ]]; then
+    user_cancel_exit
+  fi
+}
+
+_gum_input_or_exit() {
+  local ec=0 out
+  out="$(gum input "$@")" || ec=$?
+  if [[ "$ec" -ne 0 ]]; then
+    user_cancel_exit
+  fi
+  printf '%s' "$out"
 }
 
 _mktemp_track() {
@@ -3647,8 +3730,8 @@ portainer_divergence_gate() {
   esac
   if [[ -t 0 ]] && [[ "$AUTO_YES" != "true" ]]; then
     if command -v gum >/dev/null 2>&1; then
-      _gum_confirm_or_interrupt "Proceed with non-standard Portainer recreate?" --default=false || return 1
-      return 0
+      _gum_choose_yes_no "Proceed with non-standard Portainer recreate?" false && return 0
+      return 1
     fi
     local ans
     read -r -p "Proceed with non-standard Portainer recreate? [y/N] " ans || return 1
@@ -4295,11 +4378,9 @@ _tui_schedule_notice() {
   if command -v gum >/dev/null 2>&1; then
     lines="$(printf '%s\n' "$msg" | wc -l | tr -d ' ')"
     if [[ "${lines:-0}" -le 3 && ${#msg} -lt 200 ]]; then
-      _gum_confirm_or_interrupt "$msg" --default=true --affirmative "Continue" >/dev/null 2>&1 || true
+      _gum_ack_or_exit "$msg" --affirmative "Continue"
     else
-      _tui_screen_reset
-      printf '%s\n' "$msg" | gum pager --soft-wrap 2>/dev/null || true
-      _tui_screen_reset
+      _gum_pager_or_interrupt "$msg"
     fi
     return 0
   fi
@@ -4313,15 +4394,12 @@ _tui_display_text_block() {
   printf -v combined '%s\n\n%s\n\n(q to return)' "$header" "$body"
 
   if command -v gum >/dev/null 2>&1; then
+    _gum_pager_or_interrupt "$combined"
+    return 0
+  fi
+  if command -v less >/dev/null 2>&1; then
     _tui_screen_reset
-    if printf '%s\n' "$combined" | gum pager --soft-wrap 2>/dev/null; then
-      _tui_screen_reset
-      return 0
-    fi
-    if command -v less >/dev/null 2>&1; then
-      _tui_screen_reset
-      printf '%s\n' "$combined" | less 2>/dev/null && _tui_screen_reset && return 0
-    fi
+    printf '%s\n' "$combined" | less 2>/dev/null && _tui_screen_reset && return 0
   fi
 
   _tui_screen_reset
@@ -4360,9 +4438,9 @@ _tui_display_schedule_status() {
 
   if ! _schedule_has_managed_install; then
     if command -v gum >/dev/null 2>&1; then
-      if _gum_confirm_or_interrupt \
+      if _gum_choose_yes_no \
         $'No automatic Stack Updater runs are scheduled (cron or systemd).\n\nInstall a schedule now?' \
-        --default=false --affirmative "Yes" --negative "No"; then
+        false; then
         _tui_run_schedule_install_wizard || true
       fi
       _tui_screen_reset
@@ -4382,9 +4460,7 @@ _tui_display_schedule_status() {
   printf -v combined '%s\n\n%s\n\n(q to return)' "Current schedule (cron + systemd)" "$body"
 
   if command -v gum >/dev/null 2>&1; then
-    _tui_screen_reset
-    printf '%s\n' "$combined" | gum pager --soft-wrap 2>/dev/null || true
-    _tui_screen_reset
+    _gum_pager_or_interrupt "$combined"
     return 0
   fi
 
@@ -4488,12 +4564,9 @@ _pick_schedule_preset() {
       "daily_0400" "weekly_sun_0400" "monthly_1st_0400" "custom_cron" "Back")"
     [[ "$p" == "Back" || -z "$p" ]] && return 1
     if [[ "$p" == "custom_cron" ]]; then
-      local ec=0 inp
-      inp="$(gum input --placeholder "0 4 * * *" --header "5-field cron expression")" || ec=$?
-      if _gum_exit_is_interrupt "$ec"; then
-        user_cancel_exit
-      fi
-      [[ "$ec" -ne 0 || -z "$inp" ]] && return 1
+      local inp
+      inp="$(_gum_input_or_exit --placeholder "0 4 * * *" --header "5-field cron expression")"
+      [[ -z "$inp" ]] && return 1
       p="$inp"
     fi
     printf '%s' "$p"
@@ -4594,19 +4667,19 @@ _pick_action_menu_choice() {
 }
 
 _run_tui_pipeline_expert_gum() {
-  _gum_confirm_or_interrupt "Upgrade host packages?" --default=true && UPDATE_HOST_PACKAGES="true" || UPDATE_HOST_PACKAGES="false"
-  _gum_confirm_or_interrupt "Upgrade Docker-related packages?" --default=true && UPDATE_DOCKER_PACKAGES="true" || UPDATE_DOCKER_PACKAGES="false"
-  _gum_confirm_or_interrupt "Recreate Portainer container when image updates?" --default=true && UPDATE_PORTAINER_CONTAINER="true" || UPDATE_PORTAINER_CONTAINER="false"
-  _gum_confirm_or_interrupt "Prune unused images in cleanup?" --default=true && PRUNE_UNUSED_IMAGES="true" || PRUNE_UNUSED_IMAGES="false"
-  _gum_confirm_or_interrupt "Prune unused networks?" --default=true && PRUNE_UNUSED_NETWORKS="true" || PRUNE_UNUSED_NETWORKS="false"
-  _gum_confirm_or_interrupt "Prune unused Docker volumes? (unused only; can delete data if volumes become unused)" --default=false && PRUNE_UNUSED_VOLUMES="true" || PRUNE_UNUSED_VOLUMES="false"
-  _gum_confirm_or_interrupt "SKIP host apt when dry-run sim shows nothing?" --default=false && SKIP_HOST_IF_NONE="true" || SKIP_HOST_IF_NONE="false"
-  _gum_confirm_or_interrupt "SKIP Docker pkgs when sim shows nothing?" --default=false && SKIP_DOCKER_PKGS_IF_NONE="true" || SKIP_DOCKER_PKGS_IF_NONE="false"
-  _gum_confirm_or_interrupt "SKIP entire stacks phase when Cup reports 0 outdated?" --default=false && SKIP_STACK_PHASE_IF_CUP_CLEAN="true" || SKIP_STACK_PHASE_IF_CUP_CLEAN="false"
-  _gum_confirm_or_interrupt "SKIP cleanup when stacks phase skipped (Cup gate)?" --default=true && SKIP_CLEANUP_IF_STACKS_SKIPPED="true" || SKIP_CLEANUP_IF_STACKS_SKIPPED="false"
-  _gum_confirm_or_interrupt "Prompt before Portainer stack redeploys?" --default=false && STACK_UPDATE_PROMPT="true" || STACK_UPDATE_PROMPT="false"
-  _gum_confirm_or_interrupt "Selective stack redeploy (Cup / digest)?" --default=true && SELECTIVE_STACK_REDEPLOY="true" || SELECTIVE_STACK_REDEPLOY="false"
-  _gum_confirm_or_interrupt "Redeploy git stacks when Cup unknown (with selective)?" --default=true && REDEPLOY_GIT_STACKS_IF_CUP_UNKNOWN="true" || REDEPLOY_GIT_STACKS_IF_CUP_UNKNOWN="false"
+  if _gum_choose_yes_no "Upgrade host packages?" true; then UPDATE_HOST_PACKAGES="true"; else UPDATE_HOST_PACKAGES="false"; fi
+  if _gum_choose_yes_no "Upgrade Docker-related packages?" true; then UPDATE_DOCKER_PACKAGES="true"; else UPDATE_DOCKER_PACKAGES="false"; fi
+  if _gum_choose_yes_no "Recreate Portainer container when image updates?" true; then UPDATE_PORTAINER_CONTAINER="true"; else UPDATE_PORTAINER_CONTAINER="false"; fi
+  if _gum_choose_yes_no "Prune unused images in cleanup?" true; then PRUNE_UNUSED_IMAGES="true"; else PRUNE_UNUSED_IMAGES="false"; fi
+  if _gum_choose_yes_no "Prune unused networks?" true; then PRUNE_UNUSED_NETWORKS="true"; else PRUNE_UNUSED_NETWORKS="false"; fi
+  if _gum_choose_yes_no "Prune unused Docker volumes? (unused only; can delete data if volumes become unused)" false; then PRUNE_UNUSED_VOLUMES="true"; else PRUNE_UNUSED_VOLUMES="false"; fi
+  if _gum_choose_yes_no "SKIP host apt when dry-run sim shows nothing?" false; then SKIP_HOST_IF_NONE="true"; else SKIP_HOST_IF_NONE="false"; fi
+  if _gum_choose_yes_no "SKIP Docker pkgs when sim shows nothing?" false; then SKIP_DOCKER_PKGS_IF_NONE="true"; else SKIP_DOCKER_PKGS_IF_NONE="false"; fi
+  if _gum_choose_yes_no "SKIP entire stacks phase when Cup reports 0 outdated?" false; then SKIP_STACK_PHASE_IF_CUP_CLEAN="true"; else SKIP_STACK_PHASE_IF_CUP_CLEAN="false"; fi
+  if _gum_choose_yes_no "SKIP cleanup when stacks phase skipped (Cup gate)?" true; then SKIP_CLEANUP_IF_STACKS_SKIPPED="true"; else SKIP_CLEANUP_IF_STACKS_SKIPPED="false"; fi
+  if _gum_choose_yes_no "Prompt before Portainer stack redeploys?" false; then STACK_UPDATE_PROMPT="true"; else STACK_UPDATE_PROMPT="false"; fi
+  if _gum_choose_yes_no "Selective stack redeploy (Cup / digest)?" true; then SELECTIVE_STACK_REDEPLOY="true"; else SELECTIVE_STACK_REDEPLOY="false"; fi
+  if _gum_choose_yes_no "Redeploy git stacks when Cup unknown (with selective)?" true; then REDEPLOY_GIT_STACKS_IF_CUP_UNKNOWN="true"; else REDEPLOY_GIT_STACKS_IF_CUP_UNKNOWN="false"; fi
   local pol
   pol="$(_gum_choose_or_exit --header "Registry fail policy (selective, no Cup)" "safe (default)" "strict")"
   case "$pol" in
