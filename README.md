@@ -184,8 +184,8 @@ Run it:
 
 Running without arguments in a TTY opens a minimal interactive menu:
 
-1. Choose quiet or verbose output, then confirmation behavior.
-2. Pick an action (update phases, report, **Manage scheduled runs**, expert options).
+1. Choose quiet or verbose output, open **Manage scheduled runs** (cron/systemd), then confirmation behavior.
+2. Pick an action (update phases, report, expert options).
 
 Advanced session-only options are available from the expert menu.
 
@@ -328,7 +328,7 @@ Built-in rotation: when `LOG_FILE` exceeds `LOG_MAX_BYTES` (default 5 MiB), it i
 
 ## Scheduling (cron and systemd)
 
-From the action menu, choose **Manage scheduled runs** to install, view, or remove a cron or systemd timer. **Cron** and **systemd timer** are offered equally; on Debian LXC with systemd as init, timers integrate with journald; cron is more portable in minimal containers.
+On the first menu (with quiet/verbose), choose **Manage scheduled runs** to install, view, or remove a cron or systemd timer. **Cron** and **systemd timer** are offered equally; on Debian LXC with systemd as init, timers integrate with journald; cron is more portable in minimal containers.
 
 Managed entries are tagged `# stack-updater-managed` (cron) or `stack-updater-managed` (systemd) and are replaced idempotently on reinstall. Install/remove only touches that cron block or `stack-updater.service` / `stack-updater.timer` — other crontab lines and systemd units are never modified.
 
