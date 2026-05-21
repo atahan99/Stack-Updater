@@ -154,6 +154,11 @@ SHOW_VERSION="false"
 EMPTY_INVOCATION="false"
 declare -a PHASE_QUEUE=()
 
+# Set by _gum_choose_or_exit / _gum_input_or_exit (never use $(...) — exit would not reach main shell).
+GUM_CHOOSE_RESULT=""
+GUM_INPUT_RESULT=""
+GUM_MENU_RESULT=""
+
 ########################################
 # RUNTIME: Portainer stacks cache (invalidated after Portainer self-update)
 ########################################
@@ -1596,7 +1601,7 @@ _gum_choose_or_exit() {
   if [[ "$ec" -ne 0 ]] || _gum_exit_is_interrupt "$ec" || [[ -z "${out//[[:space:]]/}" ]]; then
     user_cancel_exit
   fi
-  printf '%s' "$out"
+  GUM_CHOOSE_RESULT="$out"
 }
 
 # Yes/No via choose so Ctrl+C always exits (confirm maps Ctrl+C to "No", exit 1).
@@ -1609,7 +1614,8 @@ _gum_choose_yes_no() {
     ylabel="Yes"
     nlabel="No (default)"
   fi
-  pick="$(_gum_choose_or_exit --header "$hdr" "$ylabel" "$nlabel")"
+  _gum_choose_or_exit --header "$hdr" "$ylabel" "$nlabel"
+  pick="$GUM_CHOOSE_RESULT"
   [[ "$pick" == *Yes* ]]
 }
 
@@ -1644,12 +1650,17 @@ _gum_pager_or_interrupt() {
 }
 
 _gum_input_or_exit() {
-  local ec=0 out
-  out="$(gum input "$@")" || ec=$?
-  if [[ "$ec" -ne 0 ]]; then
+  local ec=0 out tmp
+  tmp="$(_mktemp_track)"
+  set +e
+  gum input "$@" >"$tmp"
+  ec=$?
+  set -e
+  out="$(cat "$tmp" 2>/dev/null || true)"
+  if [[ "$ec" -ne 0 ]] || _gum_exit_is_interrupt "$ec"; then
     user_cancel_exit
   fi
-  printf '%s' "$out"
+  GUM_INPUT_RESULT="$out"
 }
 
 _mktemp_track() {
@@ -4100,10 +4111,11 @@ run_tui_session_minimal() {
   while true; do
     if command -v gum >/dev/null 2>&1; then
       local pick confmode
-      pick="$(_gum_choose_or_exit --header "$header" \
+      _gum_choose_or_exit --header "$header" \
         "Quiet — minimal TTY: checklist + colors (default)" \
         "Verbose — full detail + streamed package/docker commands" \
-        "Manage scheduled runs")"
+        "Manage scheduled runs"
+      pick="$GUM_CHOOSE_RESULT"
       case "$pick" in
         *Manage*)
           manage_scheduled_runs || true
@@ -4148,8 +4160,9 @@ run_tui_session_minimal() {
 
   if command -v gum >/dev/null 2>&1; then
     local confmode
-    confmode="$(_gum_choose_or_exit --header "Confirmations for this session" \
-      "No extra prompts before phases (default)" "Confirm before each major step")"
+    _gum_choose_or_exit --header "Confirmations for this session" \
+      "No extra prompts before phases (default)" "Confirm before each major step"
+    confmode="$GUM_CHOOSE_RESULT"
     case "$confmode" in
       *Confirm*) CONFIRM_EACH_STEP="true" ;;
       *) CONFIRM_EACH_STEP="false" ;;
@@ -4204,25 +4217,27 @@ run_tui_expert_pipeline_shell() {
 
 run_tui_expert_gum() {
   local appear preset
-  appear="$(_gum_choose_or_exit --header "Quiet tree appearance (this session)" \
+  _gum_choose_or_exit --header "Quiet tree appearance (this session)" \
     "Color always + emoji done row (default)" \
     "Respect NO_COLOR (auto) + checkmark" \
     "No ANSI colors (never)" \
-    "Back")"
+    "Back"
+  appear="$GUM_CHOOSE_RESULT"
   [[ -z "$appear" || "$appear" == "Back" ]] && return 0
   case "$appear" in
     *auto*) STACK_UPDATER_COLOR="auto"; STACK_UPDATER_DONE_MARK="check" ;;
     *never*) STACK_UPDATER_COLOR="never"; STACK_UPDATER_DONE_MARK="check" ;;
     *) STACK_UPDATER_COLOR="always"; STACK_UPDATER_DONE_MARK="emoji" ;;
   esac
-  preset="$(_gum_choose_or_exit --header "Pipeline & skip behavior (session)" \
+  _gum_choose_or_exit --header "Pipeline & skip behavior (session)" \
     "Full script defaults (typical homelab)" \
     "Enable selective stack redeploy (Cup / digest)" \
     "Enable skip-if-clean (host, Docker pkgs when nothing to upgrade)" \
     "Skip stack phase when Cup reports zero image updates" \
     "Prompt before Portainer stack redeploys" \
     "Expert: set each flag" \
-    "Back")"
+    "Back"
+  preset="$GUM_CHOOSE_RESULT"
   [[ -z "$preset" || "$preset" == "Back" ]] && return 0
   case "$preset" in
     *selective*)
@@ -4412,13 +4427,15 @@ _tui_display_text_block() {
 _tui_run_schedule_install_wizard() {
   local backend preset
   if command -v gum >/dev/null 2>&1; then
-    backend="$(_gum_choose_or_exit --header "Scheduler backend" "cron" "systemd" "Back")"
+    _gum_choose_or_exit --header "Scheduler backend" "cron" "systemd" "Back"
+    backend="$GUM_CHOOSE_RESULT"
     [[ "$backend" == "Back" || -z "$backend" ]] && return 1
   else
     read -r -p "Backend (cron/systemd): " backend || return 1
     [[ -z "$backend" ]] && return 1
   fi
-  preset="$(_pick_schedule_preset)" || return 1
+  _pick_schedule_preset || return 1
+  preset="$GUM_CHOOSE_RESULT"
   case "${backend,,}" in
     systemd)
       if [[ ! -d /run/systemd/system ]] && [[ ! -d /run/systemd ]]; then
@@ -4560,35 +4577,37 @@ _remove_managed_systemd() {
 _pick_schedule_preset() {
   local p
   if command -v gum >/dev/null 2>&1; then
-    p="$(_gum_choose_or_exit --header "Schedule preset" \
-      "daily_0400" "weekly_sun_0400" "monthly_1st_0400" "custom_cron" "Back")"
+    _gum_choose_or_exit --header "Schedule preset" \
+      "daily_0400" "weekly_sun_0400" "monthly_1st_0400" "custom_cron" "Back"
+    p="$GUM_CHOOSE_RESULT"
     [[ "$p" == "Back" || -z "$p" ]] && return 1
     if [[ "$p" == "custom_cron" ]]; then
-      local inp
-      inp="$(_gum_input_or_exit --placeholder "0 4 * * *" --header "5-field cron expression")"
-      [[ -z "$inp" ]] && return 1
-      p="$inp"
+      _gum_input_or_exit --placeholder "0 4 * * *" --header "5-field cron expression"
+      [[ -z "$GUM_INPUT_RESULT" ]] && return 1
+      p="$GUM_INPUT_RESULT"
     fi
-    printf '%s' "$p"
+    GUM_CHOOSE_RESULT="$p"
     return 0
   fi
   echo " 1) Daily 04:00  2) Weekly Sun 04:00  3) Monthly 1st 04:00  4) Custom cron  5) Back" >&2
   read -r -p "Preset [1-5]: " p || user_cancel_exit
   case "$p" in
-    1) printf '%s' 'daily_0400' ;;
-    2) printf '%s' 'weekly_sun_0400' ;;
-    3) printf '%s' 'monthly_1st_0400' ;;
-    4) read -r -p "Cron expression: " p && printf '%s' "$p" ;;
+    1) GUM_CHOOSE_RESULT='daily_0400' ;;
+    2) GUM_CHOOSE_RESULT='weekly_sun_0400' ;;
+    3) GUM_CHOOSE_RESULT='monthly_1st_0400' ;;
+    4) read -r -p "Cron expression: " p && GUM_CHOOSE_RESULT="$p" ;;
     *) return 1 ;;
   esac
+  return 0
 }
 
 manage_scheduled_runs() {
   local action backend preset
   while true; do
     if command -v gum >/dev/null 2>&1; then
-      action="$(_gum_choose_or_exit --header "Manage scheduled runs" \
-        "Install/update schedule" "Show current schedule" "Remove schedule" "Back")"
+      _gum_choose_or_exit --header "Manage scheduled runs" \
+        "Install/update schedule" "Show current schedule" "Remove schedule" "Back"
+      action="$GUM_CHOOSE_RESULT"
     else
       echo " 1) Install/update  2) Show  3) Remove  4) Back" >&2
       read -r -p "Choice: " action || user_cancel_exit
@@ -4607,7 +4626,8 @@ manage_scheduled_runs() {
         ;;
       "Remove schedule")
         if command -v gum >/dev/null 2>&1; then
-          backend="$(_gum_choose_or_exit --header "Remove schedule" "cron" "systemd" "both" "Back")"
+          _gum_choose_or_exit --header "Remove schedule" "cron" "systemd" "both" "Back"
+          backend="$GUM_CHOOSE_RESULT"
           [[ "$backend" == "Back" || -z "$backend" ]] && continue
         else
           read -r -p "Remove cron, systemd, or both? " backend || backend=""
@@ -4626,10 +4646,11 @@ manage_scheduled_runs() {
 }
 
 _pick_action_menu_choice() {
-  local hdr choice_raw
+  local hdr
+  GUM_MENU_RESULT=""
   hdr=$'Portainer stack updater — select action\nPhase actions may show more diagnostic output.'
   if command -v gum >/dev/null 2>&1; then
-    choice_raw="$(_gum_choose_or_exit --header "$hdr" \
+    _gum_choose_or_exit --header "$hdr" \
       "Report only (no changes)" \
       "Run full update (all phases)" \
       "Dry-run full update (log only)" \
@@ -4640,8 +4661,8 @@ _pick_action_menu_choice() {
       "Phase: Stacks" \
       "Phase: Docker cleanup" \
       "Expert/session options" \
-      "Exit")"
-    printf '%s' "${choice_raw:-}"
+      "Exit"
+    GUM_MENU_RESULT="$GUM_CHOOSE_RESULT"
     return 0
   fi
   printf '%s\n' "$hdr" >&2
@@ -4649,20 +4670,21 @@ _pick_action_menu_choice() {
   echo "  4) Phase: Host packages         5) Phase: Docker packages          6) Phase: Portainer container" >&2
   echo "  7) Phase: Cup diagnostics       8) Phase: Stacks                   9) Phase: Docker cleanup" >&2
   echo " 10) Expert/session options      11) Exit" >&2
+  local choice_raw
   read -r -p "Choice [1-11]: " choice_raw || choice_raw=""
   case "${choice_raw:-}" in
-    1) printf '%s' "Report only (no changes)" ;;
-    2) printf '%s' "Run full update (all phases)" ;;
-    3) printf '%s' "Dry-run full update (log only)" ;;
-    4) printf '%s' "Phase: Host packages" ;;
-    5) printf '%s' "Phase: Docker packages" ;;
-    6) printf '%s' "Phase: Portainer container" ;;
-    7) printf '%s' "Phase: Cup diagnostics" ;;
-    8) printf '%s' "Phase: Stacks" ;;
-    9) printf '%s' "Phase: Docker cleanup" ;;
-    10) printf '%s' "Expert/session options" ;;
-    11 | "") printf '%s' "Exit" ;;
-    *) printf '%s' "Exit" ;;
+    1) GUM_MENU_RESULT="Report only (no changes)" ;;
+    2) GUM_MENU_RESULT="Run full update (all phases)" ;;
+    3) GUM_MENU_RESULT="Dry-run full update (log only)" ;;
+    4) GUM_MENU_RESULT="Phase: Host packages" ;;
+    5) GUM_MENU_RESULT="Phase: Docker packages" ;;
+    6) GUM_MENU_RESULT="Phase: Portainer container" ;;
+    7) GUM_MENU_RESULT="Phase: Cup diagnostics" ;;
+    8) GUM_MENU_RESULT="Phase: Stacks" ;;
+    9) GUM_MENU_RESULT="Phase: Docker cleanup" ;;
+    10) GUM_MENU_RESULT="Expert/session options" ;;
+    11 | "") GUM_MENU_RESULT="Exit" ;;
+    *) GUM_MENU_RESULT="Exit" ;;
   esac
 }
 
@@ -4681,7 +4703,8 @@ _run_tui_pipeline_expert_gum() {
   if _gum_choose_yes_no "Selective stack redeploy (Cup / digest)?" true; then SELECTIVE_STACK_REDEPLOY="true"; else SELECTIVE_STACK_REDEPLOY="false"; fi
   if _gum_choose_yes_no "Redeploy git stacks when Cup unknown (with selective)?" true; then REDEPLOY_GIT_STACKS_IF_CUP_UNKNOWN="true"; else REDEPLOY_GIT_STACKS_IF_CUP_UNKNOWN="false"; fi
   local pol
-  pol="$(_gum_choose_or_exit --header "Registry fail policy (selective, no Cup)" "safe (default)" "strict")"
+  _gum_choose_or_exit --header "Registry fail policy (selective, no Cup)" "safe (default)" "strict"
+  pol="$GUM_CHOOSE_RESULT"
   case "$pol" in
     *strict*) REGISTRY_FAIL_POLICY="strict" ;;
     *) REGISTRY_FAIL_POLICY="safe" ;;
@@ -4693,7 +4716,8 @@ run_tui_menu() {
   run_tui_session_minimal
   local choice
   while true; do
-    choice="$(_pick_action_menu_choice)" || choice=""
+    _pick_action_menu_choice
+    choice="$GUM_MENU_RESULT"
     [[ -z "$choice" ]] && continue
     case "$choice" in
       "Exit")
