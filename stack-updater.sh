@@ -4014,21 +4014,57 @@ confirm_menu_action_unless_stepping() {
 
 run_tui_session_minimal() {
   local header="stack-updater v${STACK_UPDATER_VERSION} — session output"
+  while true; do
+    if command -v gum >/dev/null 2>&1; then
+      local pick confmode
+      pick="$(_gum_choose_or_exit --header "$header" \
+        "Quiet — minimal TTY: checklist + colors (default)" \
+        "Verbose — full detail + streamed package/docker commands" \
+        "Manage scheduled runs")"
+      case "$pick" in
+        *Manage*)
+          manage_scheduled_runs || true
+          _tui_screen_reset
+          continue
+          ;;
+        *Verbose*)
+          OUTPUT_MODE="verbose"
+          VERBOSE="true"
+          break
+          ;;
+        *)
+          OUTPUT_MODE="quiet"
+          VERBOSE="false"
+          break
+          ;;
+      esac
+    else
+      echo "$header"
+      local om
+      echo "  1) Quiet (default)   2) Verbose   3) Manage scheduled runs"
+      read -r -p "Choice [1-3]: " om || user_cancel_exit
+      case "${om:-1}" in
+        3)
+          manage_scheduled_runs || true
+          _tui_screen_reset
+          continue
+          ;;
+        2)
+          OUTPUT_MODE="verbose"
+          VERBOSE="true"
+          break
+          ;;
+        *)
+          OUTPUT_MODE="quiet"
+          VERBOSE="false"
+          break
+          ;;
+      esac
+    fi
+  done
+
   if command -v gum >/dev/null 2>&1; then
-    local outmode confmode
-    outmode="$(_gum_choose_or_exit --header "$header" \
-      "Quiet — minimal TTY: checklist + colors (default)" \
-      "Verbose — full detail + streamed package/docker commands")"
-    case "$outmode" in
-      *Verbose*)
-        OUTPUT_MODE="verbose"
-        VERBOSE="true"
-        ;;
-      *)
-        OUTPUT_MODE="quiet"
-        VERBOSE="false"
-        ;;
-    esac
+    local confmode
     confmode="$(_gum_choose_or_exit --header "Confirmations for this session" \
       "No extra prompts before phases (default)" "Confirm before each major step")"
     case "$confmode" in
@@ -4037,20 +4073,7 @@ run_tui_session_minimal() {
     esac
     return 0
   fi
-  echo "$header"
-  local om c
-  echo "  1) Quiet (default)   2) Verbose"
-  read -r -p "Output level [1-2]: " om || user_cancel_exit
-  case "${om:-1}" in
-    2)
-      OUTPUT_MODE="verbose"
-      VERBOSE="true"
-      ;;
-    *)
-      OUTPUT_MODE="quiet"
-      VERBOSE="false"
-      ;;
-  esac
+  local c
   read -r -p "Confirm before each step? [y/N] " c || true
   case "${c,,}" in y | yes) CONFIRM_EACH_STEP="true" ;; *) CONFIRM_EACH_STEP="false" ;; esac
   return 0
@@ -4206,6 +4229,10 @@ _systemd_has_managed_schedule() {
   [[ -f "$unit" ]] && grep -q "${SCHEDULE_SYSTEMD_MARKER}" "$unit" 2>/dev/null
 }
 
+_schedule_has_managed_install() {
+  _cron_has_managed_block || _systemd_has_managed_schedule
+}
+
 _format_cron_schedule_status() {
   local cr other=0
   if ! cr="$(crontab -l 2>/dev/null)"; then
@@ -4304,8 +4331,53 @@ _tui_display_text_block() {
   _tui_screen_reset
 }
 
+_tui_run_schedule_install_wizard() {
+  local backend preset
+  if command -v gum >/dev/null 2>&1; then
+    backend="$(_gum_choose_or_exit --header "Scheduler backend" "cron" "systemd" "Back")"
+    [[ "$backend" == "Back" || -z "$backend" ]] && return 1
+  else
+    read -r -p "Backend (cron/systemd): " backend || return 1
+    [[ -z "$backend" ]] && return 1
+  fi
+  preset="$(_pick_schedule_preset)" || return 1
+  case "${backend,,}" in
+    systemd)
+      if [[ ! -d /run/systemd/system ]] && [[ ! -d /run/systemd ]]; then
+        log_warn "systemd does not appear to be PID 1; consider cron for LXC/minimal containers."
+      fi
+      _install_managed_systemd "$preset"
+      ;;
+    *)
+      _install_managed_cron "$preset"
+      ;;
+  esac
+  return 0
+}
+
 _tui_display_schedule_status() {
-  local body combined
+  local body combined ans
+
+  if ! _schedule_has_managed_install; then
+    if command -v gum >/dev/null 2>&1; then
+      if _gum_confirm_or_interrupt \
+        $'No automatic Stack Updater runs are scheduled (cron or systemd).\n\nInstall a schedule now?' \
+        --default=false --affirmative "Yes" --negative "No"; then
+        _tui_run_schedule_install_wizard || true
+      fi
+      _tui_screen_reset
+      return 0
+    fi
+    _tui_screen_reset
+    printf '%s\n' "No automatic Stack Updater runs are scheduled (cron or systemd)."
+    read -r -p "Install a schedule now? [y/N] " ans || ans=""
+    case "${ans,,}" in
+      y | yes) _tui_run_schedule_install_wizard || true ;;
+    esac
+    _tui_screen_reset
+    return 0
+  fi
+
   body="$(_schedule_status_text)"
   printf -v combined '%s\n\n%s\n\n(q to return)' "Current schedule (cron + systemd)" "$body"
 
@@ -4475,25 +4547,8 @@ manage_scheduled_runs() {
         continue
         ;;
     esac
-    if command -v gum >/dev/null 2>&1; then
-      backend="$(_gum_choose_or_exit --header "Scheduler backend" "cron" "systemd" "Back")"
-      [[ "$backend" == "Back" || -z "$backend" ]] && continue
-    else
-      read -r -p "Backend (cron/systemd): " backend || backend=""
-      [[ -z "$backend" ]] && continue
-    fi
-    preset="$(_pick_schedule_preset)" || continue
-    case "${backend,,}" in
-      systemd)
-        if [[ ! -d /run/systemd/system ]] && [[ ! -d /run/systemd ]]; then
-          log_warn "systemd does not appear to be PID 1; consider cron for LXC/minimal containers."
-        fi
-        _install_managed_systemd "$preset"
-        ;;
-      *)
-        _install_managed_cron "$preset"
-        ;;
-    esac
+    _tui_run_schedule_install_wizard || true
+    continue
   done
 }
 
@@ -4511,7 +4566,6 @@ _pick_action_menu_choice() {
       "Phase: Cup diagnostics" \
       "Phase: Stacks" \
       "Phase: Docker cleanup" \
-      "Manage scheduled runs" \
       "Expert/session options" \
       "Exit")"
     printf '%s' "${choice_raw:-}"
@@ -4521,8 +4575,8 @@ _pick_action_menu_choice() {
   echo "  1) Report only (no changes)     2) Run full update (all phases)    3) Dry-run full update (log only)" >&2
   echo "  4) Phase: Host packages         5) Phase: Docker packages          6) Phase: Portainer container" >&2
   echo "  7) Phase: Cup diagnostics       8) Phase: Stacks                   9) Phase: Docker cleanup" >&2
-  echo " 10) Manage scheduled runs      11) Expert/session options      12) Exit" >&2
-  read -r -p "Choice [1-12]: " choice_raw || choice_raw=""
+  echo " 10) Expert/session options      11) Exit" >&2
+  read -r -p "Choice [1-11]: " choice_raw || choice_raw=""
   case "${choice_raw:-}" in
     1) printf '%s' "Report only (no changes)" ;;
     2) printf '%s' "Run full update (all phases)" ;;
@@ -4533,9 +4587,8 @@ _pick_action_menu_choice() {
     7) printf '%s' "Phase: Cup diagnostics" ;;
     8) printf '%s' "Phase: Stacks" ;;
     9) printf '%s' "Phase: Docker cleanup" ;;
-    10) printf '%s' "Manage scheduled runs" ;;
-    11) printf '%s' "Expert/session options" ;;
-    12 | "") printf '%s' "Exit" ;;
+    10) printf '%s' "Expert/session options" ;;
+    11 | "") printf '%s' "Exit" ;;
     *) printf '%s' "Exit" ;;
   esac
 }
@@ -4572,11 +4625,6 @@ run_tui_menu() {
     case "$choice" in
       "Exit")
         exit 0
-        ;;
-      "Manage scheduled runs")
-        manage_scheduled_runs || true
-        _tui_screen_reset
-        continue
         ;;
       "Expert/session options")
         run_tui_expert_options || true
