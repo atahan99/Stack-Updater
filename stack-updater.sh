@@ -579,7 +579,6 @@ if [[ -z "${PORTAINER_API_KEY:-}" ]] && [[ ! -f "${PORTAINER_API_KEY_FILE:-}" ]]
   echo "ERROR: PORTAINER_API_KEY or PORTAINER_API_KEY_FILE is required." >&2
   exit 1
 fi
-build_curl_opts_and_auth
 
 # Cup HTTP timeouts / refresh (config may set; normalize booleans and numeric timeout).
 case "${CUP_REFRESH_BEFORE_CHECK,,}" in
@@ -639,8 +638,9 @@ build_curl_opts_and_auth() {
   if [[ -n "${PORTAINER_API_KEY_FILE:-}" && -f "${PORTAINER_API_KEY_FILE}" ]]; then
     _pkey="$(tr -d '\r\n' <"${PORTAINER_API_KEY_FILE}")"
   fi
-  AUTH_HEADER=(-H "X-API-Key: ${_pkey}")
+  AUTH_HEADER=("X-API-Key: ${_pkey}")
 }
+build_curl_opts_and_auth
 
 _register_stack_updater_traps() {
   [[ "$STACK_UPDATER_TRAP_REGISTERED" == "true" ]] && return 0
@@ -1536,8 +1536,35 @@ mark_pipeline_hard_failure() {
 
 user_cancel_exit() {
   USER_CANCELLED="true"
-  _emit_log_file_ts "Run cancelled by user."
+  _emit_log_file_ts "Run cancelled by user (interrupt or menu cancel)."
+  printf '\nCancelled.\n' >&2
   exit 130
+}
+
+# True for SIGINT (Ctrl+C) and common terminal interrupt codes from gum.
+_gum_exit_is_interrupt() {
+  local ec="${1:-$?}"
+  [[ "$ec" -eq 130 || "$ec" -eq 2 ]]
+}
+
+# gum choose: any failure (including Ctrl+C) exits the script; never fall back to a default option.
+_gum_choose_or_exit() {
+  local ec=0 out
+  out="$(gum choose "$@")" || ec=$?
+  if [[ "$ec" -ne 0 ]]; then
+    user_cancel_exit
+  fi
+  printf '%s' "$out"
+}
+
+# gum confirm: Ctrl+C exits; decline (exit 1) is returned to the caller.
+_gum_confirm_or_interrupt() {
+  local ec=0
+  gum confirm "$@" || ec=$?
+  if _gum_exit_is_interrupt "$ec"; then
+    user_cancel_exit
+  fi
+  return "$ec"
 }
 
 _mktemp_track() {
@@ -1580,8 +1607,7 @@ _stack_updater_on_exit() {
 }
 
 _stack_updater_on_signal() {
-  _emit_log_file_ts "Received signal; exiting."
-  exit 130
+  user_cancel_exit
 }
 
 _err_trap() {
@@ -1728,7 +1754,7 @@ confirm_step() {
   fi
   local msg="$1"
   if command -v gum >/dev/null 2>&1; then
-    gum confirm --default=false "$msg" || user_cancel_exit
+    _gum_confirm_or_interrupt --default=false "$msg" || user_cancel_exit
     return 0
   fi
   local ans
@@ -3619,7 +3645,7 @@ portainer_divergence_gate() {
   esac
   if [[ -t 0 ]] && [[ "$AUTO_YES" != "true" ]]; then
     if command -v gum >/dev/null 2>&1; then
-      gum confirm "Proceed with non-standard Portainer recreate?" --default=false || return 1
+      _gum_confirm_or_interrupt "Proceed with non-standard Portainer recreate?" --default=false || return 1
       return 0
     fi
     local ans
@@ -3968,7 +3994,7 @@ confirm_tui_action() {
   local summary="$1"
   [[ "$AUTO_YES" == "true" ]] && return 0
   if command -v gum >/dev/null 2>&1; then
-    gum confirm --default=false "$summary" || user_cancel_exit
+    _gum_confirm_or_interrupt --default=false "$summary" || user_cancel_exit
     return 0
   fi
   local ans
@@ -3988,21 +4014,21 @@ run_tui_session_minimal() {
   local header="stack-updater v${STACK_UPDATER_VERSION} — session output"
   if command -v gum >/dev/null 2>&1; then
     local outmode confmode
-    outmode="$(gum choose --header "$header" \
+    outmode="$(_gum_choose_or_exit --header "$header" \
       "Quiet — minimal TTY: checklist + colors (default)" \
-      "Verbose — full detail + streamed package/docker commands")" || outmode=""
-    [[ -z "$outmode" ]] && outmode="Quiet — minimal TTY: checklist + colors (default)"
+      "Verbose — full detail + streamed package/docker commands")"
     case "$outmode" in
-      *Verbose*) OUTPUT_MODE="verbose" ;;
-      *) OUTPUT_MODE="quiet" ;;
+      *Verbose*)
+        OUTPUT_MODE="verbose"
+        VERBOSE="true"
+        ;;
+      *)
+        OUTPUT_MODE="quiet"
+        VERBOSE="false"
+        ;;
     esac
-    if [[ "$OUTPUT_MODE" == "verbose" ]]; then
-      VERBOSE="true"
-    else
-      VERBOSE="false"
-    fi
-    confmode="$(gum choose --header "Confirmations for this session" "No extra prompts before phases (default)" "Confirm before each major step")" || confmode=""
-    [[ -z "$confmode" ]] && confmode="No extra prompts before phases (default)"
+    confmode="$(_gum_choose_or_exit --header "Confirmations for this session" \
+      "No extra prompts before phases (default)" "Confirm before each major step")"
     case "$confmode" in
       *Confirm*) CONFIRM_EACH_STEP="true" ;;
       *) CONFIRM_EACH_STEP="false" ;;
@@ -4012,16 +4038,17 @@ run_tui_session_minimal() {
   echo "$header"
   local om c
   echo "  1) Quiet (default)   2) Verbose"
-  read -r -p "Output level [1-2]: " om || true
+  read -r -p "Output level [1-2]: " om || user_cancel_exit
   case "${om:-1}" in
-    2) OUTPUT_MODE="verbose" ;;
-    *) OUTPUT_MODE="quiet" ;;
+    2)
+      OUTPUT_MODE="verbose"
+      VERBOSE="true"
+      ;;
+    *)
+      OUTPUT_MODE="quiet"
+      VERBOSE="false"
+      ;;
   esac
-  if [[ "$OUTPUT_MODE" == "verbose" ]]; then
-    VERBOSE="true"
-  else
-    VERBOSE="false"
-  fi
   read -r -p "Confirm before each step? [y/N] " c || true
   case "${c,,}" in y | yes) CONFIRM_EACH_STEP="true" ;; *) CONFIRM_EACH_STEP="false" ;; esac
   return 0
@@ -4069,25 +4096,25 @@ run_tui_expert_pipeline_shell() {
 
 run_tui_expert_gum() {
   local appear preset
-  appear="$(gum choose --header "Quiet tree appearance (this session)" \
+  appear="$(_gum_choose_or_exit --header "Quiet tree appearance (this session)" \
     "Color always + emoji done row (default)" \
     "Respect NO_COLOR (auto) + checkmark" \
     "No ANSI colors (never)" \
-    "Back")" || appear=""
+    "Back")"
   [[ -z "$appear" || "$appear" == "Back" ]] && return 0
   case "$appear" in
     *auto*) STACK_UPDATER_COLOR="auto"; STACK_UPDATER_DONE_MARK="check" ;;
     *never*) STACK_UPDATER_COLOR="never"; STACK_UPDATER_DONE_MARK="check" ;;
     *) STACK_UPDATER_COLOR="always"; STACK_UPDATER_DONE_MARK="emoji" ;;
   esac
-  preset="$(gum choose --header "Pipeline & skip behavior (session)" \
+  preset="$(_gum_choose_or_exit --header "Pipeline & skip behavior (session)" \
     "Full script defaults (typical homelab)" \
     "Enable selective stack redeploy (Cup / digest)" \
     "Enable skip-if-clean (host, Docker pkgs when nothing to upgrade)" \
     "Skip stack phase when Cup reports zero image updates" \
     "Prompt before Portainer stack redeploys" \
     "Expert: set each flag" \
-    "Back")" || preset=""
+    "Back")"
   [[ -z "$preset" || "$preset" == "Back" ]] && return 0
   case "$preset" in
     *selective*)
@@ -4156,29 +4183,131 @@ _schedule_preset_to_systemd_calendar() {
   esac
 }
 
-_show_managed_cron_schedule() {
+# Print crontab with only the stack-updater-managed block removed (other lines unchanged).
+_crontab_without_managed_block() {
   local cr
+  cr="$(crontab -l 2>/dev/null)" || return 0
+  printf '%s\n' "$cr" | awk -v m="${SCHEDULE_CRON_MARKER}" '
+    $0 == m { drop=1; next }
+    drop && /flock[[:space:]].*stack-updater\.sh/ { drop=0; next }
+    drop { next }
+    { print }
+  '
+}
+
+_cron_has_managed_block() {
+  crontab -l 2>/dev/null | grep -qFx "${SCHEDULE_CRON_MARKER}"
+}
+
+_systemd_has_managed_schedule() {
+  local unit="/etc/systemd/system/stack-updater.timer"
+  [[ -f "$unit" ]] && grep -q "${SCHEDULE_SYSTEMD_MARKER}" "$unit" 2>/dev/null
+}
+
+_format_cron_schedule_status() {
+  local cr other=0
   if ! cr="$(crontab -l 2>/dev/null)"; then
-    printf '%s\n' "No user crontab or crontab unavailable."
+    printf '%s\n' "Cron: no user crontab (nothing scheduled for Stack Updater)."
     return 0
   fi
-  if grep -q "${SCHEDULE_CRON_MARKER}" <<<"$cr"; then
-    printf '%s\n' "--- Managed cron entries ---"
-    awk -v m="$SCHEDULE_CRON_MARKER" '$0 ~ m || f {print; f=($0 ~ m)}' <<<"$cr"
+  if _cron_has_managed_block; then
+    printf '%s\n' "Cron — Stack Updater managed block (${SCHEDULE_CRON_MARKER}):"
+    awk -v m="${SCHEDULE_CRON_MARKER}" '$0 == m || f {print; f=($0 == m)}' <<<"$cr"
   else
-    printf '%s\n' "No managed cron entry (${SCHEDULE_CRON_MARKER})."
+    printf '%s\n' "Cron: no Stack Updater schedule (${SCHEDULE_CRON_MARKER} not found)."
+    other="$(printf '%s\n' "$cr" | grep -cE '^[^#[:space:]]' 2>/dev/null || true)"
+    [[ "${other:-0}" -gt 0 ]] && printf '%s\n' "      Other crontab jobs on this user: ${other} line(s) — not shown; never modified by Stack Updater."
   fi
 }
 
-_show_managed_systemd_schedule() {
+_format_systemd_schedule_status() {
   local unit="/etc/systemd/system/stack-updater.timer"
-  if [[ -f "$unit" ]]; then
-    printf '%s\n' "--- stack-updater.timer ---"
+  if _systemd_has_managed_schedule; then
+    printf '%s\n' "Systemd — Stack Updater timer (${unit}):"
     cat "$unit"
-    [[ -f /etc/systemd/system/stack-updater.service ]] && printf '\n%s\n' "--- stack-updater.service ---" && cat /etc/systemd/system/stack-updater.service
+    if [[ -f /etc/systemd/system/stack-updater.service ]]; then
+      printf '\n%s\n' "--- stack-updater.service ---"
+      cat /etc/systemd/system/stack-updater.service
+    fi
   else
-    printf '%s\n' "No systemd timer at ${unit}"
+    printf '%s\n' "Systemd: no Stack Updater timer (${unit} not installed)."
   fi
+}
+
+_schedule_status_summary() {
+  local hc=0 hs=0
+  _cron_has_managed_block && hc=1
+  _systemd_has_managed_schedule && hs=1
+  if [[ "$hc" -eq 0 && "$hs" -eq 0 ]]; then
+    printf '%s\n' "Summary: No automatic Stack Updater runs are scheduled."
+    printf '%s\n' "         Install a schedule below to enable cron or systemd runs."
+  else
+    printf '%s\n' "Summary: Stack Updater has at least one active managed schedule."
+  fi
+  printf '%s\n' "Note: This tool only adds/removes lines tagged ${SCHEDULE_CRON_MARKER} or systemd units named stack-updater.*."
+}
+
+_schedule_status_text() {
+  _schedule_status_summary
+  printf '\n'
+  _format_cron_schedule_status
+  printf '\n'
+  _format_systemd_schedule_status
+}
+
+_tui_schedule_notice() {
+  local msg="$1"
+  if command -v gum >/dev/null 2>&1; then
+    gum style --foreground 10 --margin "1 0" "$msg" || printf '%s\n' "$msg"
+    _gum_confirm_or_interrupt "Continue?" --default=true >/dev/null 2>&1 || true
+  else
+    printf '%s\n' "$msg"
+    read -r -p "Press Enter to continue..." _ </dev/tty 2>/dev/null || read -r -p "Press Enter to continue..." _
+  fi
+}
+
+_tui_display_text_block() {
+  local header="$1" body="$2" combined
+  printf -v combined '%s\n\n%s' "$header" "$body"
+
+  if command -v gum >/dev/null 2>&1; then
+    # gum pager has no --header flag; prepend title in the piped content (q to quit).
+    printf '%s\n' "Press q when done reading." >&2
+    if printf '%s\n' "$combined" | gum pager --soft-wrap; then
+      return 0
+    fi
+    # Pager unavailable or failed: scroll via less when present.
+    if command -v less >/dev/null 2>&1; then
+      printf '%s\n' "$combined" | less 2>/dev/null && return 0
+    fi
+    # Last resort: confirm dialog with full text (works on older gum builds).
+    _gum_confirm_or_interrupt "$combined" --default=true --affirmative "Continue" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  if [[ -t 1 ]] && command -v clear >/dev/null 2>&1; then
+    clear
+  fi
+  printf '%s\n' "======== ${header} ========"
+  printf '%s\n' "$body"
+  read -r -p "Press Enter to return..." _ </dev/tty 2>/dev/null || read -r -p "Press Enter to return..." _
+}
+
+_tui_display_schedule_status() {
+  local body
+  body="$(_schedule_status_text)"
+  if command -v gum >/dev/null 2>&1; then
+    gum style --bold "Current schedule (cron + systemd)" 2>/dev/null || true
+    printf '%s\n' "$body" >&2
+    _gum_confirm_or_interrupt "Continue?" --default=true --affirmative "Continue" || true
+    return 0
+  fi
+  if [[ -t 1 ]] && command -v clear >/dev/null 2>&1; then
+    clear
+  fi
+  printf '%s\n' "======== Current schedule (cron + systemd) ========"
+  printf '%s\n' "$body"
+  read -r -p "Press Enter to return..." _ </dev/tty 2>/dev/null || read -r -p "Press Enter to return..." _
 }
 
 _install_managed_cron() {
@@ -4186,14 +4315,17 @@ _install_managed_cron() {
   sched="$(_schedule_preset_to_cron "$sched")"
   stack_updater_cron_valid "$sched" || fail "Invalid cron schedule: ${sched}"
   line="$(_stack_updater_cron_line "$sched")"
-  existing="$(crontab -l 2>/dev/null | grep -v "${SCHEDULE_CRON_MARKER}" | grep -v 'stack-updater.sh' | grep -v 'flock -n.*stack-updater' || true)"
   tmp="$(_mktemp_track)"
-  { printf '%s\n' "$existing"; printf '%s\n' "$line"; } >"$tmp"
-  printf '%s\n' "Will install crontab entry:"
-  printf '%s\n' "$line"
-  confirm_menu_action_unless_stepping "Install/update root/user crontab with the line above?"
+  {
+    _crontab_without_managed_block
+    printf '%s\n' "$line"
+  } >"$tmp"
+  _tui_display_text_block "Review crontab entry to install" "$(printf '%s\n' \
+    "Only the block below is added/replaced (tag ${SCHEDULE_CRON_MARKER}). Other cron jobs are kept." \
+    "" "Will install:" "$line")"
+  confirm_menu_action_unless_stepping "Install/update only the Stack Updater cron block (other crontab lines kept)?"
   crontab "$tmp"
-  printf '%s\n' "Cron schedule installed."
+  _tui_schedule_notice "Stack Updater cron block installed (other cron jobs unchanged)."
 }
 
 _install_managed_systemd() {
@@ -4201,7 +4333,7 @@ _install_managed_systemd() {
   cal="$(_schedule_preset_to_systemd_calendar "$preset")"
   svc="/etc/systemd/system/stack-updater.service"
   timer="/etc/systemd/system/stack-updater.timer"
-  printf '%s\n' "Will write ${svc} and ${timer} (requires root)."
+  _tui_display_text_block "Review systemd units to install" "$(printf '%s\n' "Will write (requires root):" "$svc" "$timer" "OnCalendar=${cal}")"
   confirm_menu_action_unless_stepping "Install systemd timer (${cal})?"
   sudo tee "$svc" >/dev/null <<EOF
 [Unit]
@@ -4229,39 +4361,61 @@ WantedBy=timers.target
 EOF
   sudo systemctl daemon-reload
   sudo systemctl enable --now stack-updater.timer
-  printf '%s\n' "Systemd timer enabled."
+  _tui_schedule_notice "Systemd timer enabled."
 }
 
 _remove_managed_cron() {
-  local existing tmp
-  existing="$(crontab -l 2>/dev/null | grep -v "${SCHEDULE_CRON_MARKER}" | grep -v 'stack-updater.sh' | grep -v 'flock -n.*stack-updater' || true)"
+  local tmp
+  if ! crontab -l >/dev/null 2>&1; then
+    _tui_schedule_notice "No user crontab; nothing to remove."
+    return 0
+  fi
+  if ! _cron_has_managed_block; then
+    _tui_schedule_notice "No Stack Updater cron block present (${SCHEDULE_CRON_MARKER}); crontab unchanged."
+    return 0
+  fi
   tmp="$(_mktemp_track)"
-  printf '%s' "$existing" >"$tmp"
-  crontab "$tmp" 2>/dev/null || crontab -r 2>/dev/null || true
-  printf '%s\n' "Removed managed cron entries."
+  _crontab_without_managed_block >"$tmp"
+  if [[ -s "$tmp" ]] && grep -q '[^[:space:]]' "$tmp" 2>/dev/null; then
+    crontab "$tmp"
+  else
+    crontab -r 2>/dev/null || true
+  fi
+  _tui_schedule_notice "Removed only the Stack Updater cron block; other cron jobs were kept."
 }
 
 _remove_managed_systemd() {
+  local unit="/etc/systemd/system/stack-updater.timer"
+  if ! _systemd_has_managed_schedule && [[ ! -f /etc/systemd/system/stack-updater.service ]]; then
+    _tui_schedule_notice "No Stack Updater systemd units present; nothing to remove."
+    return 0
+  fi
   sudo systemctl disable --now stack-updater.timer 2>/dev/null || true
-  sudo rm -f /etc/systemd/system/stack-updater.service /etc/systemd/system/stack-updater.timer
+  sudo rm -f /etc/systemd/system/stack-updater.service "$unit"
   sudo systemctl daemon-reload 2>/dev/null || true
-  printf '%s\n' "Removed stack-updater systemd units."
+  _tui_schedule_notice "Removed only stack-updater.service and stack-updater.timer."
 }
 
 _pick_schedule_preset() {
   local p
   if command -v gum >/dev/null 2>&1; then
-    p="$(gum choose --header "Schedule preset" \
-      "daily_0400" "weekly_sun_0400" "monthly_1st_0400" "custom_cron" "Back")" || p=""
+    p="$(_gum_choose_or_exit --header "Schedule preset" \
+      "daily_0400" "weekly_sun_0400" "monthly_1st_0400" "custom_cron" "Back")"
     [[ "$p" == "Back" || -z "$p" ]] && return 1
     if [[ "$p" == "custom_cron" ]]; then
-      p="$(gum input --placeholder "0 4 * * *" --header "5-field cron expression")" || return 1
+      local ec=0 inp
+      inp="$(gum input --placeholder "0 4 * * *" --header "5-field cron expression")" || ec=$?
+      if _gum_exit_is_interrupt "$ec"; then
+        user_cancel_exit
+      fi
+      [[ "$ec" -ne 0 || -z "$inp" ]] && return 1
+      p="$inp"
     fi
     printf '%s' "$p"
     return 0
   fi
   echo " 1) Daily 04:00  2) Weekly Sun 04:00  3) Monthly 1st 04:00  4) Custom cron  5) Back" >&2
-  read -r -p "Preset [1-5]: " p || return 1
+  read -r -p "Preset [1-5]: " p || user_cancel_exit
   case "$p" in
     1) printf '%s' 'daily_0400' ;;
     2) printf '%s' 'weekly_sun_0400' ;;
@@ -4273,65 +4427,68 @@ _pick_schedule_preset() {
 
 manage_scheduled_runs() {
   local action backend preset
-  if command -v gum >/dev/null 2>&1; then
-    action="$(gum choose --header "Manage scheduled runs" \
-      "Install/update schedule" "Show current schedule" "Remove schedule" "Back")" || action=""
-  else
-    echo " 1) Install/update  2) Show  3) Remove  4) Back" >&2
-    read -r -p "Choice: " action || action=""
-    case "$action" in
-      1) action="Install/update schedule" ;;
-      2) action="Show current schedule" ;;
-      3) action="Remove schedule" ;;
-      *) action="Back" ;;
-    esac
-  fi
-  [[ -z "$action" || "$action" == "Back" ]] && return 0
-  case "$action" in
-    "Show current schedule")
-      _show_managed_cron_schedule
-      _show_managed_systemd_schedule
-      return 0
-      ;;
-    "Remove schedule")
-      if command -v gum >/dev/null 2>&1; then
-        backend="$(gum choose "cron" "systemd" "both")" || backend=""
-      else
-        read -r -p "Remove cron, systemd, or both? " backend || backend=""
-      fi
-      case "${backend,,}" in
-        cron) _remove_managed_cron ;;
-        systemd) _remove_managed_systemd ;;
-        *) _remove_managed_cron; _remove_managed_systemd ;;
+  while true; do
+    if command -v gum >/dev/null 2>&1; then
+      action="$(_gum_choose_or_exit --header "Manage scheduled runs" \
+        "Install/update schedule" "Show current schedule" "Remove schedule" "Back")"
+    else
+      echo " 1) Install/update  2) Show  3) Remove  4) Back" >&2
+      read -r -p "Choice: " action || user_cancel_exit
+      case "$action" in
+        1) action="Install/update schedule" ;;
+        2) action="Show current schedule" ;;
+        3) action="Remove schedule" ;;
+        *) action="Back" ;;
       esac
-      return 0
-      ;;
-  esac
-  if command -v gum >/dev/null 2>&1; then
-    backend="$(gum choose --header "Scheduler backend (equal choice)" "cron" "systemd")" || backend=""
-  else
-    read -r -p "Backend (cron/systemd): " backend || backend=""
-  fi
-  [[ -z "$backend" ]] && return 0
-  preset="$(_pick_schedule_preset)" || return 0
-  case "${backend,,}" in
-    systemd)
-      if [[ ! -d /run/systemd/system ]] && [[ ! -d /run/systemd ]]; then
-        log_warn "systemd does not appear to be PID 1; consider cron for LXC/minimal containers."
-      fi
-      _install_managed_systemd "$preset"
-      ;;
-    *)
-      _install_managed_cron "$preset"
-      ;;
-  esac
+    fi
+    [[ -z "$action" || "$action" == "Back" ]] && return 0
+    case "$action" in
+      "Show current schedule")
+        _tui_display_schedule_status
+        continue
+        ;;
+      "Remove schedule")
+        if command -v gum >/dev/null 2>&1; then
+          backend="$(_gum_choose_or_exit --header "Remove schedule" "cron" "systemd" "both" "Back")"
+          [[ "$backend" == "Back" || -z "$backend" ]] && continue
+        else
+          read -r -p "Remove cron, systemd, or both? " backend || backend=""
+        fi
+        case "${backend,,}" in
+          cron) _remove_managed_cron ;;
+          systemd) _remove_managed_systemd ;;
+          *) _remove_managed_cron; _remove_managed_systemd ;;
+        esac
+        continue
+        ;;
+    esac
+    if command -v gum >/dev/null 2>&1; then
+      backend="$(_gum_choose_or_exit --header "Scheduler backend" "cron" "systemd" "Back")"
+      [[ "$backend" == "Back" || -z "$backend" ]] && continue
+    else
+      read -r -p "Backend (cron/systemd): " backend || backend=""
+      [[ -z "$backend" ]] && continue
+    fi
+    preset="$(_pick_schedule_preset)" || continue
+    case "${backend,,}" in
+      systemd)
+        if [[ ! -d /run/systemd/system ]] && [[ ! -d /run/systemd ]]; then
+          log_warn "systemd does not appear to be PID 1; consider cron for LXC/minimal containers."
+        fi
+        _install_managed_systemd "$preset"
+        ;;
+      *)
+        _install_managed_cron "$preset"
+        ;;
+    esac
+  done
 }
 
 _pick_action_menu_choice() {
   local hdr choice_raw
   hdr=$'Portainer stack updater — select action\nPhase actions may show more diagnostic output.'
   if command -v gum >/dev/null 2>&1; then
-    choice_raw="$(gum choose --header "$hdr" \
+    choice_raw="$(_gum_choose_or_exit --header "$hdr" \
       "Report only (no changes)" \
       "Run full update (all phases)" \
       "Dry-run full update (log only)" \
@@ -4343,7 +4500,7 @@ _pick_action_menu_choice() {
       "Phase: Docker cleanup" \
       "Manage scheduled runs" \
       "Expert/session options" \
-      "Exit")" || choice_raw=""
+      "Exit")"
     printf '%s' "${choice_raw:-}"
     return 0
   fi
@@ -4371,21 +4528,21 @@ _pick_action_menu_choice() {
 }
 
 _run_tui_pipeline_expert_gum() {
-  gum confirm "Upgrade host packages?" --default=true && UPDATE_HOST_PACKAGES="true" || UPDATE_HOST_PACKAGES="false"
-  gum confirm "Upgrade Docker-related packages?" --default=true && UPDATE_DOCKER_PACKAGES="true" || UPDATE_DOCKER_PACKAGES="false"
-  gum confirm "Recreate Portainer container when image updates?" --default=true && UPDATE_PORTAINER_CONTAINER="true" || UPDATE_PORTAINER_CONTAINER="false"
-  gum confirm "Prune unused images in cleanup?" --default=true && PRUNE_UNUSED_IMAGES="true" || PRUNE_UNUSED_IMAGES="false"
-  gum confirm "Prune unused networks?" --default=true && PRUNE_UNUSED_NETWORKS="true" || PRUNE_UNUSED_NETWORKS="false"
-  gum confirm "Prune unused Docker volumes? (unused only; can delete data if volumes become unused)" --default=false && PRUNE_UNUSED_VOLUMES="true" || PRUNE_UNUSED_VOLUMES="false"
-  gum confirm "SKIP host apt when dry-run sim shows nothing?" --default=false && SKIP_HOST_IF_NONE="true" || SKIP_HOST_IF_NONE="false"
-  gum confirm "SKIP Docker pkgs when sim shows nothing?" --default=false && SKIP_DOCKER_PKGS_IF_NONE="true" || SKIP_DOCKER_PKGS_IF_NONE="false"
-  gum confirm "SKIP entire stacks phase when Cup reports 0 outdated?" --default=false && SKIP_STACK_PHASE_IF_CUP_CLEAN="true" || SKIP_STACK_PHASE_IF_CUP_CLEAN="false"
-  gum confirm "SKIP cleanup when stacks phase skipped (Cup gate)?" --default=true && SKIP_CLEANUP_IF_STACKS_SKIPPED="true" || SKIP_CLEANUP_IF_STACKS_SKIPPED="false"
-  gum confirm "Prompt before Portainer stack redeploys?" --default=false && STACK_UPDATE_PROMPT="true" || STACK_UPDATE_PROMPT="false"
-  gum confirm "Selective stack redeploy (Cup / digest)?" --default=true && SELECTIVE_STACK_REDEPLOY="true" || SELECTIVE_STACK_REDEPLOY="false"
-  gum confirm "Redeploy git stacks when Cup unknown (with selective)?" --default=true && REDEPLOY_GIT_STACKS_IF_CUP_UNKNOWN="true" || REDEPLOY_GIT_STACKS_IF_CUP_UNKNOWN="false"
+  _gum_confirm_or_interrupt "Upgrade host packages?" --default=true && UPDATE_HOST_PACKAGES="true" || UPDATE_HOST_PACKAGES="false"
+  _gum_confirm_or_interrupt "Upgrade Docker-related packages?" --default=true && UPDATE_DOCKER_PACKAGES="true" || UPDATE_DOCKER_PACKAGES="false"
+  _gum_confirm_or_interrupt "Recreate Portainer container when image updates?" --default=true && UPDATE_PORTAINER_CONTAINER="true" || UPDATE_PORTAINER_CONTAINER="false"
+  _gum_confirm_or_interrupt "Prune unused images in cleanup?" --default=true && PRUNE_UNUSED_IMAGES="true" || PRUNE_UNUSED_IMAGES="false"
+  _gum_confirm_or_interrupt "Prune unused networks?" --default=true && PRUNE_UNUSED_NETWORKS="true" || PRUNE_UNUSED_NETWORKS="false"
+  _gum_confirm_or_interrupt "Prune unused Docker volumes? (unused only; can delete data if volumes become unused)" --default=false && PRUNE_UNUSED_VOLUMES="true" || PRUNE_UNUSED_VOLUMES="false"
+  _gum_confirm_or_interrupt "SKIP host apt when dry-run sim shows nothing?" --default=false && SKIP_HOST_IF_NONE="true" || SKIP_HOST_IF_NONE="false"
+  _gum_confirm_or_interrupt "SKIP Docker pkgs when sim shows nothing?" --default=false && SKIP_DOCKER_PKGS_IF_NONE="true" || SKIP_DOCKER_PKGS_IF_NONE="false"
+  _gum_confirm_or_interrupt "SKIP entire stacks phase when Cup reports 0 outdated?" --default=false && SKIP_STACK_PHASE_IF_CUP_CLEAN="true" || SKIP_STACK_PHASE_IF_CUP_CLEAN="false"
+  _gum_confirm_or_interrupt "SKIP cleanup when stacks phase skipped (Cup gate)?" --default=true && SKIP_CLEANUP_IF_STACKS_SKIPPED="true" || SKIP_CLEANUP_IF_STACKS_SKIPPED="false"
+  _gum_confirm_or_interrupt "Prompt before Portainer stack redeploys?" --default=false && STACK_UPDATE_PROMPT="true" || STACK_UPDATE_PROMPT="false"
+  _gum_confirm_or_interrupt "Selective stack redeploy (Cup / digest)?" --default=true && SELECTIVE_STACK_REDEPLOY="true" || SELECTIVE_STACK_REDEPLOY="false"
+  _gum_confirm_or_interrupt "Redeploy git stacks when Cup unknown (with selective)?" --default=true && REDEPLOY_GIT_STACKS_IF_CUP_UNKNOWN="true" || REDEPLOY_GIT_STACKS_IF_CUP_UNKNOWN="false"
   local pol
-  pol="$(gum choose --header "Registry fail policy (selective, no Cup)" "safe (default)" "strict")" || pol="safe (default)"
+  pol="$(_gum_choose_or_exit --header "Registry fail policy (selective, no Cup)" "safe (default)" "strict")"
   case "$pol" in
     *strict*) REGISTRY_FAIL_POLICY="strict" ;;
     *) REGISTRY_FAIL_POLICY="safe" ;;
