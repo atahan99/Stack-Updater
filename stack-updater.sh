@@ -1550,6 +1550,7 @@ _gum_exit_is_interrupt() {
 # gum choose: any failure (including Ctrl+C) exits the script; never fall back to a default option.
 _gum_choose_or_exit() {
   local ec=0 out
+  _tui_screen_reset
   out="$(gum choose "$@")" || ec=$?
   if [[ "$ec" -ne 0 ]]; then
     user_cancel_exit
@@ -1560,6 +1561,7 @@ _gum_choose_or_exit() {
 # gum confirm: Ctrl+C exits; decline (exit 1) is returned to the caller.
 _gum_confirm_or_interrupt() {
   local ec=0
+  _tui_screen_reset
   gum confirm "$@" || ec=$?
   if _gum_exit_is_interrupt "$ec"; then
     user_cancel_exit
@@ -4255,59 +4257,70 @@ _schedule_status_text() {
   _format_systemd_schedule_status
 }
 
+_tui_screen_reset() {
+  [[ -t 1 ]] || return 0
+  command -v clear >/dev/null 2>&1 && clear
+  printf '\033[3J' 2>/dev/null || true
+}
+
 _tui_schedule_notice() {
-  local msg="$1"
+  local msg="$1" lines
   if command -v gum >/dev/null 2>&1; then
-    gum style --foreground 10 --margin "1 0" "$msg" || printf '%s\n' "$msg"
-    _gum_confirm_or_interrupt "Continue?" --default=true >/dev/null 2>&1 || true
-  else
-    printf '%s\n' "$msg"
-    read -r -p "Press Enter to continue..." _ </dev/tty 2>/dev/null || read -r -p "Press Enter to continue..." _
+    lines="$(printf '%s\n' "$msg" | wc -l | tr -d ' ')"
+    if [[ "${lines:-0}" -le 3 && ${#msg} -lt 200 ]]; then
+      _gum_confirm_or_interrupt "$msg" --default=true --affirmative "Continue" >/dev/null 2>&1 || true
+    else
+      _tui_screen_reset
+      printf '%s\n' "$msg" | gum pager --soft-wrap 2>/dev/null || true
+      _tui_screen_reset
+    fi
+    return 0
   fi
+  _tui_screen_reset
+  printf '%s\n' "$msg"
+  read -r -p "Press Enter to continue..." _ </dev/tty 2>/dev/null || read -r -p "Press Enter to continue..." _
 }
 
 _tui_display_text_block() {
   local header="$1" body="$2" combined
-  printf -v combined '%s\n\n%s' "$header" "$body"
+  printf -v combined '%s\n\n%s\n\n(q to return)' "$header" "$body"
 
   if command -v gum >/dev/null 2>&1; then
-    # gum pager has no --header flag; prepend title in the piped content (q to quit).
-    printf '%s\n' "Press q when done reading." >&2
-    if printf '%s\n' "$combined" | gum pager --soft-wrap; then
+    _tui_screen_reset
+    if printf '%s\n' "$combined" | gum pager --soft-wrap 2>/dev/null; then
+      _tui_screen_reset
       return 0
     fi
-    # Pager unavailable or failed: scroll via less when present.
     if command -v less >/dev/null 2>&1; then
-      printf '%s\n' "$combined" | less 2>/dev/null && return 0
+      _tui_screen_reset
+      printf '%s\n' "$combined" | less 2>/dev/null && _tui_screen_reset && return 0
     fi
-    # Last resort: confirm dialog with full text (works on older gum builds).
-    _gum_confirm_or_interrupt "$combined" --default=true --affirmative "Continue" >/dev/null 2>&1 || true
-    return 0
   fi
 
-  if [[ -t 1 ]] && command -v clear >/dev/null 2>&1; then
-    clear
-  fi
+  _tui_screen_reset
   printf '%s\n' "======== ${header} ========"
   printf '%s\n' "$body"
   read -r -p "Press Enter to return..." _ </dev/tty 2>/dev/null || read -r -p "Press Enter to return..." _
+  _tui_screen_reset
 }
 
 _tui_display_schedule_status() {
-  local body
+  local body combined
   body="$(_schedule_status_text)"
+  printf -v combined '%s\n\n%s\n\n(q to return)' "Current schedule (cron + systemd)" "$body"
+
   if command -v gum >/dev/null 2>&1; then
-    gum style --bold "Current schedule (cron + systemd)" 2>/dev/null || true
-    printf '%s\n' "$body" >&2
-    _gum_confirm_or_interrupt "Continue?" --default=true --affirmative "Continue" || true
+    _tui_screen_reset
+    printf '%s\n' "$combined" | gum pager --soft-wrap 2>/dev/null || true
+    _tui_screen_reset
     return 0
   fi
-  if [[ -t 1 ]] && command -v clear >/dev/null 2>&1; then
-    clear
-  fi
+
+  _tui_screen_reset
   printf '%s\n' "======== Current schedule (cron + systemd) ========"
   printf '%s\n' "$body"
   read -r -p "Press Enter to return..." _ </dev/tty 2>/dev/null || read -r -p "Press Enter to return..." _
+  _tui_screen_reset
 }
 
 _install_managed_cron() {
@@ -4550,6 +4563,7 @@ _run_tui_pipeline_expert_gum() {
 }
 
 run_tui_menu() {
+  _tui_screen_reset
   run_tui_session_minimal
   local choice
   while true; do
@@ -4561,10 +4575,12 @@ run_tui_menu() {
         ;;
       "Manage scheduled runs")
         manage_scheduled_runs || true
+        _tui_screen_reset
         continue
         ;;
       "Expert/session options")
         run_tui_expert_options || true
+        _tui_screen_reset
         continue
         ;;
       "Report only (no changes)")
