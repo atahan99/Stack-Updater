@@ -193,18 +193,7 @@ PHASE_SEC_PORTAINER=""
 PHASE_SEC_STACKS=""
 PHASE_SEC_CLEANUP=""
 # Subgroup counters for stacks phase (quiet UX metrics).
-STACK_GRP_DEP_CHECKED=0
-STACK_GRP_DEP_REDEPLOYED=0
-STACK_GRP_DEP_FAILED=0
-STACK_GRP_DEPENDENT_CHECKED=0
-STACK_GRP_DEPENDENT_REDEPLOYED=0
-STACK_GRP_DEPENDENT_FAILED=0
-STACK_GRP_HEAVY_CHECKED=0
-STACK_GRP_HEAVY_REDEPLOYED=0
-STACK_GRP_HEAVY_FAILED=0
-STACK_GRP_REMAINING_CHECKED=0
-STACK_GRP_REMAINING_REDEPLOYED=0
-STACK_GRP_REMAINING_FAILED=0
+declare -A STACK_GRP_METRICS=()
 RUN_WARNING_COUNT=0
 # Captured during docker pkgs phase for quiet System lines.
 DOCKER_VER_DISPLAY=""
@@ -269,10 +258,7 @@ reset_full_pipeline_summaries() {
   _PORTAINER_REG_DIGEST=""
   _PORTAINER_REG_VERSION=""
   _PORTAINER_VER_SERVER=""
-  LAST_CUP_TRACKED=""
-  LAST_CUP_OUTDATED=""
-  LAST_CUP_CURRENT=""
-  LAST_CUP_UNKNOWN=""
+  _cup_clear_last_metrics
   CUP_STATUS="not_checked"
   CUP_LAST_ERROR=""
   CUP_JSON_SNAPSHOT=""
@@ -318,18 +304,7 @@ reset_full_pipeline_summaries() {
   PHASE_SEC_PORTAINER=""
   PHASE_SEC_STACKS=""
   PHASE_SEC_CLEANUP=""
-  STACK_GRP_DEP_CHECKED=0
-  STACK_GRP_DEP_REDEPLOYED=0
-  STACK_GRP_DEP_FAILED=0
-  STACK_GRP_DEPENDENT_CHECKED=0
-  STACK_GRP_DEPENDENT_REDEPLOYED=0
-  STACK_GRP_DEPENDENT_FAILED=0
-  STACK_GRP_HEAVY_CHECKED=0
-  STACK_GRP_HEAVY_REDEPLOYED=0
-  STACK_GRP_HEAVY_FAILED=0
-  STACK_GRP_REMAINING_CHECKED=0
-  STACK_GRP_REMAINING_REDEPLOYED=0
-  STACK_GRP_REMAINING_FAILED=0
+  _stack_grp_reset
   RUN_WARNING_COUNT=0
   PIPELINE_HARD_FAILURE=0
   DOCKER_VER_DISPLAY=""
@@ -341,8 +316,36 @@ reset_full_pipeline_summaries() {
   STACK_RUN_LOG=()
 }
 
-reset_phases_list_summaries() {
-  reset_full_pipeline_summaries
+_stack_grp_reset() {
+  STACK_GRP_METRICS=()
+}
+
+_stack_grp_get() {
+  printf '%s' "${STACK_GRP_METRICS[${1}:${2}]:-0}"
+}
+
+_stack_grp_checked_sum() {
+  local g sum=0 v
+  for g in dependency dependent heavy remaining; do
+    v="$(_stack_grp_get "$g" checked)"
+    sum=$((sum + v))
+  done
+  printf '%s' "$sum"
+}
+
+_sync_output_mode() {
+  if [[ "${OUTPUT_MODE:-quiet}" == "verbose" ]]; then
+    VERBOSE="true"
+  else
+    VERBOSE="false"
+  fi
+}
+
+_cup_clear_last_metrics() {
+  LAST_CUP_TRACKED=""
+  LAST_CUP_OUTDATED=""
+  LAST_CUP_CURRENT=""
+  LAST_CUP_UNKNOWN=""
 }
 
 usage() {
@@ -539,11 +542,7 @@ esac
 if [[ "${VERBOSE:-false}" == "true" ]]; then
   OUTPUT_MODE="verbose"
 fi
-if [[ "$OUTPUT_MODE" == "verbose" ]]; then
-  VERBOSE="true"
-else
-  VERBOSE="false"
-fi
+_sync_output_mode
 
 [[ "$NO_COLOR_CLI" == "true" ]] && STACK_UPDATER_COLOR="never"
 
@@ -802,16 +801,6 @@ ui_indent_kv() {
 ui_blank() {
   _quiet_tree_tty || return 0
   printf '\n'
-}
-
-_format_mm_ss() {
-  local secs="${1:-0}"
-  printf '%02d:%02d' $((secs / 60)) $((secs % 60))
-}
-
-# Human-readable duration (e.g. 3m 12s) — reusable reporting helper.
-format_duration() {
-  _format_duration_secs "${1:-0}"
 }
 
 ########################################
@@ -1086,21 +1075,8 @@ compute_stack_deploy_total() {
 }
 
 _stack_subgroup_bump() {
-  local grp="${1:-}" kind="${2:-}"
-  case "${grp}:${kind}" in
-    dependency:checked) STACK_GRP_DEP_CHECKED=$((STACK_GRP_DEP_CHECKED + 1)) ;;
-    dependency:redeployed) STACK_GRP_DEP_REDEPLOYED=$((STACK_GRP_DEP_REDEPLOYED + 1)) ;;
-    dependency:failed) STACK_GRP_DEP_FAILED=$((STACK_GRP_DEP_FAILED + 1)) ;;
-    dependent:checked) STACK_GRP_DEPENDENT_CHECKED=$((STACK_GRP_DEPENDENT_CHECKED + 1)) ;;
-    dependent:redeployed) STACK_GRP_DEPENDENT_REDEPLOYED=$((STACK_GRP_DEPENDENT_REDEPLOYED + 1)) ;;
-    dependent:failed) STACK_GRP_DEPENDENT_FAILED=$((STACK_GRP_DEPENDENT_FAILED + 1)) ;;
-    heavy:checked) STACK_GRP_HEAVY_CHECKED=$((STACK_GRP_HEAVY_CHECKED + 1)) ;;
-    heavy:redeployed) STACK_GRP_HEAVY_REDEPLOYED=$((STACK_GRP_HEAVY_REDEPLOYED + 1)) ;;
-    heavy:failed) STACK_GRP_HEAVY_FAILED=$((STACK_GRP_HEAVY_FAILED + 1)) ;;
-    remaining:checked) STACK_GRP_REMAINING_CHECKED=$((STACK_GRP_REMAINING_CHECKED + 1)) ;;
-    remaining:redeployed) STACK_GRP_REMAINING_REDEPLOYED=$((STACK_GRP_REMAINING_REDEPLOYED + 1)) ;;
-    remaining:failed) STACK_GRP_REMAINING_FAILED=$((STACK_GRP_REMAINING_FAILED + 1)) ;;
-  esac
+  local grp="${1:-}" kind="${2:-}" key="${1}:${2}"
+  STACK_GRP_METRICS["$key"]=$(( ${STACK_GRP_METRICS[$key]:-0} + 1 ))
 }
 
 _endpoint_display_hint() {
@@ -1186,15 +1162,15 @@ quiet_print_update_strategy_block() {
 quiet_print_stack_subgroup_metrics_block() {
   # Log-only subgroup counters (verbose: mirror to log; quiet TTY skips extra blank line here).
   if [[ "${OUTPUT_MODE:-quiet}" == "verbose" ]]; then
-    ui_mirror_line "[stack-metrics] dependency checked=${STACK_GRP_DEP_CHECKED} redeployed=${STACK_GRP_DEP_REDEPLOYED} failed=${STACK_GRP_DEP_FAILED}"
-    ui_mirror_line "[stack-metrics] dependent checked=${STACK_GRP_DEPENDENT_CHECKED} redeployed=${STACK_GRP_DEPENDENT_REDEPLOYED} failed=${STACK_GRP_DEPENDENT_FAILED}"
-    ui_mirror_line "[stack-metrics] heavy checked=${STACK_GRP_HEAVY_CHECKED} redeployed=${STACK_GRP_HEAVY_REDEPLOYED} failed=${STACK_GRP_HEAVY_FAILED}"
-    ui_mirror_line "[stack-metrics] remaining checked=${STACK_GRP_REMAINING_CHECKED} redeployed=${STACK_GRP_REMAINING_REDEPLOYED} failed=${STACK_GRP_REMAINING_FAILED}"
+    ui_mirror_line "[stack-metrics] dependency checked=$(_stack_grp_get dependency checked) redeployed=$(_stack_grp_get dependency redeployed) failed=$(_stack_grp_get dependency failed)"
+    ui_mirror_line "[stack-metrics] dependent checked=$(_stack_grp_get dependent checked) redeployed=$(_stack_grp_get dependent redeployed) failed=$(_stack_grp_get dependent failed)"
+    ui_mirror_line "[stack-metrics] heavy checked=$(_stack_grp_get heavy checked) redeployed=$(_stack_grp_get heavy redeployed) failed=$(_stack_grp_get heavy failed)"
+    ui_mirror_line "[stack-metrics] remaining checked=$(_stack_grp_get remaining checked) redeployed=$(_stack_grp_get remaining redeployed) failed=$(_stack_grp_get remaining failed)"
   else
-    _emit_log_file_ts "[stack-metrics] dependency checked=${STACK_GRP_DEP_CHECKED} redeployed=${STACK_GRP_DEP_REDEPLOYED} failed=${STACK_GRP_DEP_FAILED}"
-    _emit_log_file_ts "[stack-metrics] dependent checked=${STACK_GRP_DEPENDENT_CHECKED} redeployed=${STACK_GRP_DEPENDENT_REDEPLOYED} failed=${STACK_GRP_DEPENDENT_FAILED}"
-    _emit_log_file_ts "[stack-metrics] heavy checked=${STACK_GRP_HEAVY_CHECKED} redeployed=${STACK_GRP_HEAVY_REDEPLOYED} failed=${STACK_GRP_HEAVY_FAILED}"
-    _emit_log_file_ts "[stack-metrics] remaining checked=${STACK_GRP_REMAINING_CHECKED} redeployed=${STACK_GRP_REMAINING_REDEPLOYED} failed=${STACK_GRP_REMAINING_FAILED}"
+    _emit_log_file_ts "[stack-metrics] dependency checked=$(_stack_grp_get dependency checked) redeployed=$(_stack_grp_get dependency redeployed) failed=$(_stack_grp_get dependency failed)"
+    _emit_log_file_ts "[stack-metrics] dependent checked=$(_stack_grp_get dependent checked) redeployed=$(_stack_grp_get dependent redeployed) failed=$(_stack_grp_get dependent failed)"
+    _emit_log_file_ts "[stack-metrics] heavy checked=$(_stack_grp_get heavy checked) redeployed=$(_stack_grp_get heavy redeployed) failed=$(_stack_grp_get heavy failed)"
+    _emit_log_file_ts "[stack-metrics] remaining checked=$(_stack_grp_get remaining checked) redeployed=$(_stack_grp_get remaining redeployed) failed=$(_stack_grp_get remaining failed)"
   fi
   # Do not use `cmd && [[ ... ]] && printf` as the final statement: under `set -e`, a failed `[[` in quiet mode
   # makes this function return 1 and aborts the whole pipeline after stacks (before CLEANUP / RUN SUMMARY).
@@ -1467,10 +1443,6 @@ quiet_live_clear_safe() {
   printf '\r\033[K' >&2 2>/dev/null || true
 }
 
-quiet_live_clear() {
-  quiet_live_clear_safe
-}
-
 # Single-line status on stderr (TTY + quiet). Not written to LOG_FILE.
 quiet_live() {
   [[ -t 2 ]] || return 0
@@ -1738,27 +1710,33 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
 }
 
-run_apt_get() {
+_run_cmd_quiet_capture() {
+  local warn_prefix="$1" log_fn="$2"
+  shift 2
   local tmp ec line
   if [[ "$DRY_RUN" == "true" ]]; then
     return 0
   fi
   if [[ "${OUTPUT_MODE:-quiet}" == "verbose" ]]; then
-    apt-get "$@" || return $?
+    "$@" || return $?
     return 0
   fi
   tmp="$(mktemp)"
-  if apt-get "$@" >>"$tmp" 2>&1; then
+  if "$@" >>"$tmp" 2>&1; then
     rm -f "$tmp"
     return 0
   fi
   ec=$?
-  log_warn "apt-get $* failed (exit ${ec}); last lines:"
+  log_warn "${warn_prefix} failed (exit ${ec}); last lines:"
   while IFS= read -r line || [[ -n "$line" ]]; do
-    _emit_log "$line"
+    $log_fn "$line"
   done < <(tail -40 "$tmp")
   rm -f "$tmp"
   return "$ec"
+}
+
+run_apt_get() {
+  _run_cmd_quiet_capture "apt-get $*" _emit_log apt-get "$@"
 }
 
 # Prefer nala for update/upgrade/autoremove when installed. Simulations stay on apt-get -s.
@@ -1777,7 +1755,6 @@ run_pkg_mgr() {
 }
 
 run_nala() {
-  local tmp ec line
   local -a cmd=()
   local nf=(env DEBIAN_FRONTEND=noninteractive)
 
@@ -1786,9 +1763,7 @@ run_nala() {
   fi
 
   case "$1" in
-    # `nala update` only supports a small option set — no assume-yes on this subcommand.
     update) cmd=("${nf[@]}" nala update) ;;
-    # Match split apt-get: refresh already done; keep autoremove as a separate step.
     upgrade) cmd=("${nf[@]}" nala upgrade -y --no-update --no-autoremove) ;;
     autoremove) cmd=("${nf[@]}" nala autoremove -y) ;;
     install) cmd=("${nf[@]}" nala "$@") ;;
@@ -1799,18 +1774,7 @@ run_nala() {
     "${cmd[@]}" || return $?
     return 0
   fi
-  tmp="$(mktemp)"
-  if "${cmd[@]}" >>"$tmp" 2>&1; then
-    rm -f "$tmp"
-    return 0
-  fi
-  ec=$?
-  _emit_log_file_ts "nala failed (exit ${ec}); falling back to apt-get. Last lines:"
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    _emit_log_file_only "$line"
-  done < <(tail -40 "$tmp")
-  rm -f "$tmp"
-  return "$ec"
+  _run_cmd_quiet_capture "nala (falling back to apt-get)" _emit_log_file_only "${cmd[@]}"
 }
 
 run_docker() {
@@ -1827,12 +1791,12 @@ run_docker() {
   fi
   tmp="$(mktemp)"
   if docker "$@" >>"$tmp" 2>&1; then
-    [[ "${1:-}" == "pull" ]] && quiet_live_clear
+    [[ "${1:-}" == "pull" ]] && quiet_live_clear_safe
     rm -f "$tmp"
     return 0
   fi
   ec=$?
-  [[ "${1:-}" == "pull" ]] && quiet_live_clear
+  [[ "${1:-}" == "pull" ]] && quiet_live_clear_safe
   log_warn "docker $* failed (exit ${ec}); last lines:"
   while IFS= read -r line || [[ -n "$line" ]]; do
     _emit_log "$line"
@@ -2114,62 +2078,6 @@ init_selective_context() {
       fi
     fi
   fi
-}
-
-cup_outdated_image_lines_from_json() {
-  local json="${1:-}"
-  [[ -z "$json" ]] && return 0
-  echo "$json" | jq -r '
-    (
-      [ .images[]?
-        | select(
-            ((.result // empty | type == "object") and .result.has_update == true)
-            or (.update_available == true)
-          )
-        | (.reference // .image // .name // empty) | strings ]
-      + [ .containers[]?
-        | select(
-            ((.result // empty | type == "object") and .result.has_update == true)
-            or (.update_available == true)
-          )
-        | (.image // .name // .reference // empty) | strings ]
-    ) | .[] | select(length > 0)
-  ' 2>/dev/null | sort -u | sed '/^$/d' || true
-}
-
-compose_images_match_cup_outdated() {
-  local compose_content="$1" cup_json="$2"
-  local outdated img cup_ln
-  SELECTIVE_CUP_MATCH_REF=""
-  outdated="$(cup_outdated_image_lines_from_json "$cup_json")"
-  [[ -z "$outdated" ]] && return 1
-  while IFS= read -r img; do
-    [[ -z "$img" ]] && continue
-    while IFS= read -r cup_ln; do
-      [[ -z "$cup_ln" ]] && continue
-      if _cup_image_refs_equivalent "$img" "$cup_ln"; then
-        SELECTIVE_CUP_MATCH_REF="$cup_ln"
-        return 0
-      fi
-    done <<<"$outdated"
-  done <<<"$(compose_image_lines_from_content "$compose_content")"
-  return 1
-}
-
-registry_digest_for_image_ref() {
-  local manifest
-  manifest="$(docker manifest inspect "$1" 2>/dev/null)" || return 0
-  registry_digest_from_manifest_json "$manifest"
-}
-
-local_digest_for_image_ref() {
-  local rd
-  rd="$(docker image inspect --format '{{index .RepoDigests 0}}' "$1" 2>/dev/null || true)"
-  if [[ -n "$rd" && "$rd" == *@* ]]; then
-    printf '%s' "${rd#*@}"
-    return 0
-  fi
-  printf '%s' ""
 }
 
 # Sets global registry_selective_reason on first positive signal.
@@ -2638,31 +2546,28 @@ docker_running_container_count() {
 }
 
 cup_compute_counts_from_json() {
-  local json="$1"
-  local out
-  out="$(echo "$json" | jq -r '
+  local json="$1" out filter
+  filter="$(_cup_jq_is_outdated)"
+  out="$(echo "$json" | jq -r "
     def num(v):
       (v // 0
-       | if type == "string" then (tonumber? // 0) elif type == "number" then . else 0 end);
-    if (.metrics | type) == "object" then
-      "\(num(.metrics.monitored_images)) \(num(.metrics.updates_available)) \(num(.metrics.up_to_date)) \(num(.metrics.unknown))"
+       | if type == \"string\" then (tonumber? // 0) elif type == \"number\" then . else 0 end);
+    if (.metrics | type) == \"object\" then
+      \"\\(num(.metrics.monitored_images)) \\(num(.metrics.updates_available)) \\(num(.metrics.up_to_date)) \\(num(.metrics.unknown))\"
     else
-      (if (.images | type) == "array" then .images
-       elif (.containers | type) == "array" then .containers
+      (if (.images | type) == \"array\" then .images
+       elif (.containers | type) == \"array\" then .containers
        else null
-       end) as $items
-      | if $items == null then "-1 -1 -1 -1"
+       end) as \$items
+      | if \$items == null then \"-1 -1 -1 -1\"
         else
-          ($items | length) as $t
-          | ($items | map(select(
-                ((.result // empty | type == "object") and .result.has_update == true)
-                or (.update_available == true)
-              )) | length) as $o
-          | ($t - $o) as $c
-          | "\($t) \($o) \($c) 0"
+          (\$items | length) as \$t
+          | (\$items | map(select(${filter})) | length) as \$o
+          | (\$t - \$o) as \$c
+          | \"\\(\$t) \\(\$o) \\(\$c) 0\"
         end
     end
-  ' 2>/dev/null)" || out="-1 -1 -1 -1"
+  " 2>/dev/null)" || out="-1 -1 -1 -1"
   [[ -z "${out:-}" ]] && out="-1 -1 -1 -1"
   echo "$out"
 }
@@ -2699,10 +2604,7 @@ print_statistics_block() {
   if [[ "${CUP_ENABLED:-false}" != "true" ]]; then
     log_verbose "$(printf '%-32s | %s' "Cup image tracking" "disabled (${CUP_URL:-no URL})")"
     log_verbose "--"
-    LAST_CUP_TRACKED=""
-    LAST_CUP_OUTDATED=""
-    LAST_CUP_CURRENT=""
-    LAST_CUP_UNKNOWN=""
+    _cup_clear_last_metrics
     CUP_STATUS="not_checked"
     CUP_LAST_ERROR=""
     CUP_JSON_SNAPSHOT=""
@@ -2748,10 +2650,7 @@ print_statistics_block() {
       CUP_LAST_ERROR="unreachable"
       log_warn "$(printf '%-32s | %s' "Cup (${CUP_URL})" "unreachable")"
       log_verbose "--"
-      LAST_CUP_TRACKED=""
-      LAST_CUP_OUTDATED=""
-      LAST_CUP_CURRENT=""
-      LAST_CUP_UNKNOWN=""
+      _cup_clear_last_metrics
       if [[ "$cup_tty" == "true" ]]; then
         print_info 4 "$(_leg_icon failed) Cup: unreachable (${CUP_URL})"
       fi
@@ -2770,10 +2669,7 @@ print_statistics_block() {
     CUP_LAST_ERROR="parse_error"
     log_warn "Cup JSON: could not derive counts (schema mismatch?)."
     log_verbose "--"
-    LAST_CUP_TRACKED=""
-    LAST_CUP_OUTDATED=""
-    LAST_CUP_CURRENT=""
-    LAST_CUP_UNKNOWN=""
+    _cup_clear_last_metrics
     if [[ "$cup_tty" == "true" ]]; then
       print_info 4 "$(_leg_icon failed) Cup: could not parse counts (schema mismatch?)"
     fi
@@ -2798,38 +2694,34 @@ print_statistics_block() {
   fi
 
   if [[ "${OUTPUT_MODE:-quiet}" == "verbose" ]]; then
+    local outdated_filter
+    outdated_filter="$(_cup_jq_is_outdated)"
     {
-      echo "$json" | jq -r '
+      echo "$json" | jq -r "
         [
           (.images // [])[]?
-          | select(
-              ((.result // empty | type == "object") and .result.has_update == true)
-              or (.update_available == true)
-            )
+          | select(${outdated_filter})
           | {
-              r: (.reference // .image // .name // ""),
-              c: (.result.info.current_version // .result.info.current_tag // ""),
-              n: (.result.info.new_version // .result.info.new_tag // ""),
-              t: (.result.info.version_update_type // .result.info.type // "")
+              r: (.reference // .image // .name // \"\"),
+              c: (.result.info.current_version // .result.info.current_tag // \"\"),
+              n: (.result.info.new_version // .result.info.new_tag // \"\"),
+              t: (.result.info.version_update_type // .result.info.type // \"\")
             },
           (.containers // [])[]?
-          | select(
-              ((.result // empty | type == "object") and .result.has_update == true)
-              or (.update_available == true)
-            )
+          | select(${outdated_filter})
           | {
-              r: (.image // .name // .reference // ""),
-              c: (.result.info.current_version // .result.info.current_tag // ""),
-              n: (.result.info.new_version // .result.info.new_tag // ""),
-              t: (.result.info.version_update_type // .result.info.type // "")
+              r: (.image // .name // .reference // \"\"),
+              c: (.result.info.current_version // .result.info.current_tag // \"\"),
+              n: (.result.info.new_version // .result.info.new_tag // \"\"),
+              t: (.result.info.version_update_type // .result.info.type // \"\")
             }
         ]
-        | map(select((.r | type == "string") and (.r | length) > 0))
+        | map(select((.r | type == \"string\") and (.r | length) > 0))
         | group_by(.r)
         | map(.[0])
         | .[0:40][]
-        | "outdated: \(.r) \(.c) → \(.n) \(.t)"
-      ' 2>/dev/null | while read -r line; do
+        | \"outdated: \\(.r) \\(.c) → \\(.n) \\(.t)\"
+      " 2>/dev/null | while read -r line; do
         [[ -n "$line" ]] && log_detail "  $line"
       done
     } || true
@@ -2852,7 +2744,7 @@ report_cup_summary() {
   [[ "$OUTPUT_MODE" == "quiet" ]] && OUTPUT_MODE="verbose"
   print_pipeline_statistics "cup_summary"
   OUTPUT_MODE="$saved"
-  [[ "$OUTPUT_MODE" == "verbose" ]] && VERBOSE=true || VERBOSE=false
+  _sync_output_mode
 }
 
 should_skip_stack_phase_for_cup() {
@@ -2889,17 +2781,7 @@ should_skip_stack_phase_for_cup() {
   return 1
 }
 
-# True if any image: line in compose content matches Cup outdated ref.
-_cup_compose_stack_matches_outdated_ref() {
-  local compose_content="$1" cup_ref="$2"
-  local img
-  [[ -z "$cup_ref" ]] && return 1
-  while IFS= read -r img; do
-    [[ -z "$img" ]] && continue
-    _cup_image_refs_equivalent "$img" "$cup_ref" && return 0
-  done <<<"$(compose_image_lines_from_content "$compose_content")"
-  return 1
-}
+# True if any image: line in compose content matches Cup outdated ref (core: _compose_images_match_cup_ref).
 
 # One-shot Cup diagnostics (URL, refresh, JSON, metrics, outdated refs, Portainer compose matches).
 cup_run_selftest_phase() {
@@ -2980,7 +2862,7 @@ cup_run_selftest_phase() {
       sid="$(get_stack_id_by_name "$sname" 2>/dev/null || true)"
       [[ -z "$sid" ]] && continue
       sc="$(get_stack_file_content "$sid" 2>/dev/null || true)"
-      if _cup_compose_stack_matches_outdated_ref "$sc" "$ref"; then
+      if _compose_images_match_cup_ref "$sc" "$ref"; then
         stacks="${stacks}${stacks:+ }${sname}"
       fi
     done < <(get_all_stack_names_for_endpoint)
@@ -3193,15 +3075,6 @@ redeploy_stack_by_name() {
 # WAIT HELPERS
 ########################################
 
-# Format seconds as MM:SS for stack-timing lines.
-_stack_secs_to_mmss() {
-  local s="${1:-0}"
-  local m r
-  m=$((s / 60))
-  r=$((s % 60))
-  printf '%02d:%02d' "$m" "$r"
-}
-
 # After redeploy_stack_by_name: one post-redeploy wait keyed by group (no duplicate default+group sleeps).
 # Uses STACK_LAST_ACTUAL_REDEPLOY, STACK_LAST_DRY_RUN_PLANNED_REDEPLOY, STACK_LAST_REDEPLOY_SECS.
 # Sets STACK_LAST_POST_WAIT_SECS to seconds slept (0 if skipped or dry-run).
@@ -3209,7 +3082,7 @@ stack_post_redeploy_wait_for_group() {
   local stack_name="$1"
   local group="$2"
   local redeploy_secs="${STACK_LAST_REDEPLOY_SECS:-0}"
-  local t_ws tw tot
+  local wait_secs t_ws tw tot
 
   STACK_LAST_POST_WAIT_SECS=0
 
@@ -3223,19 +3096,16 @@ stack_post_redeploy_wait_for_group() {
         _emit_log_file_ts "[wait] ${stack_name} dry-run; would run container readiness (poll) then ${DEPENDENCY_SETTLE_SECONDS}s dependency settle"
         ;;
       dependent)
-        _emit_log_file_ts "[wait] ${stack_name} dry-run; would wait ${DEPENDENT_STACK_SLEEP_SECONDS}s after ${stack_name} (dependent)"
+        _emit_log_file_ts "[wait] ${stack_name} dry-run; would wait $(stack_wait_seconds_for_group dependent)s after ${stack_name} (dependent)"
         ;;
       heavy)
-        _emit_log_file_ts "[wait] ${stack_name} dry-run; would wait ${HEAVY_STACK_SLEEP_SECONDS}s after ${stack_name} (heavy)"
-        ;;
-      remaining)
-        _emit_log_file_ts "[wait] ${stack_name} dry-run; would wait ${DEFAULT_STACK_SLEEP_SECONDS}s after ${stack_name}"
+        _emit_log_file_ts "[wait] ${stack_name} dry-run; would wait $(stack_wait_seconds_for_group heavy)s after ${stack_name} (heavy)"
         ;;
       *)
-        _emit_log_file_ts "[wait] ${stack_name} dry-run; would wait ${DEFAULT_STACK_SLEEP_SECONDS}s after ${stack_name}"
+        _emit_log_file_ts "[wait] ${stack_name} dry-run; would wait $(stack_wait_seconds_for_group "$group")s after ${stack_name}"
         ;;
     esac
-    _emit_log_file_ts "[stack-timing] ${stack_name} redeploy=$(_stack_secs_to_mmss "$redeploy_secs") wait=00:00 total=$(_stack_secs_to_mmss "$redeploy_secs")"
+    _emit_log_file_ts "[stack-timing] ${stack_name} redeploy=$(_format_mm_ss "$redeploy_secs") wait=00:00 total=$(_format_mm_ss "$redeploy_secs")"
     return 0
   fi
 
@@ -3255,27 +3125,26 @@ stack_post_redeploy_wait_for_group() {
       sleep "$DEPENDENCY_SETTLE_SECONDS"
       ;;
     dependent)
-      _emit_log_file_ts "[wait] ${stack_name} redeployed; dependent wait ${DEPENDENT_STACK_SLEEP_SECONDS}s"
-      sleep "$DEPENDENT_STACK_SLEEP_SECONDS"
+      wait_secs="$(stack_wait_seconds_for_group dependent)"
+      _emit_log_file_ts "[wait] ${stack_name} redeployed; dependent wait ${wait_secs}s"
+      sleep "$wait_secs"
       ;;
     heavy)
-      _emit_log_file_ts "[wait] ${stack_name} redeployed; heavy wait ${HEAVY_STACK_SLEEP_SECONDS}s"
-      sleep "$HEAVY_STACK_SLEEP_SECONDS"
-      ;;
-    remaining)
-      _emit_log_file_ts "[wait] ${stack_name} redeployed; sleeping ${DEFAULT_STACK_SLEEP_SECONDS}s"
-      sleep "$DEFAULT_STACK_SLEEP_SECONDS"
+      wait_secs="$(stack_wait_seconds_for_group heavy)"
+      _emit_log_file_ts "[wait] ${stack_name} redeployed; heavy wait ${wait_secs}s"
+      sleep "$wait_secs"
       ;;
     *)
-      _emit_log_file_ts "[wait] ${stack_name} redeployed; sleeping ${DEFAULT_STACK_SLEEP_SECONDS}s"
-      sleep "$DEFAULT_STACK_SLEEP_SECONDS"
+      wait_secs="$(stack_wait_seconds_for_group "$group")"
+      _emit_log_file_ts "[wait] ${stack_name} redeployed; sleeping ${wait_secs}s"
+      sleep "$wait_secs"
       ;;
   esac
   tw=$(($(date +%s 2>/dev/null || echo 0) - t_ws))
   [[ "$tw" -lt 0 ]] && tw=0
   STACK_LAST_POST_WAIT_SECS=$tw
   tot=$((redeploy_secs + tw))
-  _emit_log_file_ts "[stack-timing] ${stack_name} redeploy=$(_stack_secs_to_mmss "$redeploy_secs") wait=$(_stack_secs_to_mmss "$tw") total=$(_stack_secs_to_mmss "$tot")"
+  _emit_log_file_ts "[stack-timing] ${stack_name} redeploy=$(_format_mm_ss "$redeploy_secs") wait=$(_format_mm_ss "$tw") total=$(_format_mm_ss "$tot")"
 }
 
 container_is_running() {
@@ -3391,7 +3260,7 @@ update_host_packages() {
   }
   quiet_live "Host packages: autoremove…"
   run_pkg_mgr autoremove -y || log_warn "host package autoremove failed"
-  quiet_live_clear
+  quiet_live_clear_safe
   SUMMARY_PHASE_HOST="ran"
 }
 
@@ -3428,7 +3297,7 @@ update_docker_packages() {
       log_warn "Docker package upgrade failed"
     }
 
-  quiet_live_clear
+  quiet_live_clear_safe
   DOCKER_VER_DISPLAY="$(docker --version 2>/dev/null || echo 'Docker unavailable')"
   COMPOSE_VER_DISPLAY="$(docker compose version 2>/dev/null || echo 'Docker Compose unavailable')"
   _emit_log_file_ts "${DOCKER_VER_DISPLAY}"
@@ -3444,30 +3313,42 @@ update_docker_packages() {
 # ORDERED DEPLOYMENT
 ########################################
 
-deploy_dependency_stacks() {
-  local stack_name dep_any_redeployed=0 dep_wait_total=0
+deploy_stack_group() {
+  local group="$1"
+  local -n stack_list="$2"
+  local stack_name dep_any_redeployed=0 dep_wait_total=0 _dsid _hid progress_label
 
   if _quiet_tree_tty; then
     printf '\n'
-    quiet_stack_subgroup_title "$(_stack_group_display_name dependency)"
+    quiet_stack_subgroup_title "$(_stack_group_display_name "$group")"
   fi
-  if [[ "${#DEPENDENCY_STACKS[@]}" -eq 0 ]]; then
+  if [[ "${#stack_list[@]}" -eq 0 ]]; then
     if _quiet_tree_tty; then
       quiet_subnote_dim "(none configured)"
     fi
-    log_detail "No dependency stacks configured."
-    SUMMARY_STACK_SUB_DEPENDENCY="none configured"
+    log_detail "No ${group} stacks configured."
+    case "$group" in
+      dependency) SUMMARY_STACK_SUB_DEPENDENCY="none configured" ;;
+      dependent) SUMMARY_STACK_SUB_DEPENDENT="none configured" ;;
+      heavy) SUMMARY_STACK_SUB_HEAVY="none configured" ;;
+    esac
     return 0
   fi
 
-  log_step "stacks: dependency group (${#DEPENDENCY_STACKS[@]} configured)"
-  progress_child "Dependency stacks (${#DEPENDENCY_STACKS[@]} in order)"
+  case "$group" in
+    dependency) progress_label="Dependency stacks (${#stack_list[@]} in order)" ;;
+    dependent) progress_label="Dependent stacks (${#stack_list[@]} in order)" ;;
+    heavy) progress_label="Heavy stacks (${#stack_list[@]} in config order)" ;;
+    *) progress_label="${group} stacks" ;;
+  esac
 
-  for stack_name in "${DEPENDENCY_STACKS[@]}"; do
+  log_step "stacks: ${group} group (${#stack_list[@]} configured)"
+  progress_child "$progress_label"
+
+  for stack_name in "${stack_list[@]}"; do
     [[ -n "$stack_name" ]] || continue
 
-    if [[ "${SELECTIVE_STACK_REDEPLOY:-false}" == "true" ]]; then
-      local _dsid _dsj
+    if [[ "$group" == "dependency" ]] && [[ "${SELECTIVE_STACK_REDEPLOY:-false}" == "true" ]]; then
       _dsid="$(get_stack_id_by_name "$stack_name")"
       if [[ -z "$_dsid" ]]; then
         log_warn "Dependency stack not found (skipping): ${stack_name}"
@@ -3478,108 +3359,67 @@ deploy_dependency_stacks() {
       fi
     fi
 
-    redeploy_stack_by_name "$stack_name" "dependency" || {
-      log_warn "Failed redeploying dependency stack '${stack_name}'. Continuing."
+    if [[ "$group" == "heavy" ]]; then
+      if array_contains "$stack_name" "${DEPENDENCY_STACKS[@]}" || array_contains "$stack_name" "${DEPENDENT_STACKS[@]}"; then
+        continue
+      fi
+      _hid="$(get_stack_id_by_name "$stack_name")"
+      if [[ -z "$_hid" ]]; then
+        log_detail "Heavy stack not on endpoint (skipping): ${stack_name}"
+        continue
+      fi
+    fi
+
+    redeploy_stack_by_name "$stack_name" "$group" || {
+      log_warn "Failed redeploying ${group} stack '${stack_name}'. Continuing."
       continue
     }
 
-    stack_post_redeploy_wait_for_group "$stack_name" dependency
-    if [[ "${STACK_LAST_ACTUAL_REDEPLOY:-0}" == "1" ]]; then
-      dep_any_redeployed=1
+    stack_post_redeploy_wait_for_group "$stack_name" "$group"
+    if [[ "$group" == "dependency" ]]; then
+      if [[ "${STACK_LAST_ACTUAL_REDEPLOY:-0}" == "1" ]]; then
+        dep_any_redeployed=1
+      fi
+      dep_wait_total=$((dep_wait_total + STACK_LAST_POST_WAIT_SECS))
     fi
-    dep_wait_total=$((dep_wait_total + STACK_LAST_POST_WAIT_SECS))
   done
 
-  if [[ "$dep_any_redeployed" -eq 0 ]]; then
-    if [[ "$DRY_RUN" == "true" ]]; then
-      _emit_log_file_ts "[wait] dependency group dry-run; no actual dependency settle"
-      _emit_log_file_ts "[stack-timing] dependency_settle dry-run; no actual sleeps"
+  if [[ "$group" == "dependency" ]]; then
+    if [[ "$dep_any_redeployed" -eq 0 ]]; then
+      if [[ "$DRY_RUN" == "true" ]]; then
+        _emit_log_file_ts "[wait] dependency group dry-run; no actual dependency settle"
+        _emit_log_file_ts "[stack-timing] dependency_settle dry-run; no actual sleeps"
+      else
+        _emit_log_file_ts "[wait] dependency group unchanged; no dependency settle"
+        _emit_log_file_ts "[stack-timing] dependency_settle skipped; no dependency stack redeployed"
+      fi
     else
-      _emit_log_file_ts "[wait] dependency group unchanged; no dependency settle"
-      _emit_log_file_ts "[stack-timing] dependency_settle skipped; no dependency stack redeployed"
+      _emit_log_file_ts "[stack-timing] dependency group finished; dependency_post_redeploy_wait_total=${dep_wait_total}s"
     fi
-  else
-    _emit_log_file_ts "[stack-timing] dependency group finished; dependency_post_redeploy_wait_total=${dep_wait_total}s"
   fi
 
-  quiet_stack_group_summary "$(_stack_group_display_name dependency)" "${STACK_GRP_DEP_CHECKED}" "${STACK_GRP_DEP_REDEPLOYED}" "${STACK_GRP_DEP_FAILED}"
-  SUMMARY_STACK_SUB_DEPENDENCY="completed"
+  quiet_stack_group_summary "$(_stack_group_display_name "$group")" \
+    "$(_stack_grp_get "$group" checked)" \
+    "$(_stack_grp_get "$group" redeployed)" \
+    "$(_stack_grp_get "$group" failed)"
+
+  case "$group" in
+    dependency) SUMMARY_STACK_SUB_DEPENDENCY="completed" ;;
+    dependent) SUMMARY_STACK_SUB_DEPENDENT="completed" ;;
+    heavy) SUMMARY_STACK_SUB_HEAVY="completed" ;;
+  esac
+}
+
+deploy_dependency_stacks() {
+  deploy_stack_group dependency DEPENDENCY_STACKS
 }
 
 deploy_dependent_stacks() {
-  local stack_name
-
-  if _quiet_tree_tty; then
-    printf '\n'
-    quiet_stack_subgroup_title "$(_stack_group_display_name dependent)"
-  fi
-  if [[ "${#DEPENDENT_STACKS[@]}" -eq 0 ]]; then
-    if _quiet_tree_tty; then
-      quiet_subnote_dim "(none configured)"
-    fi
-    log_detail "No dependent stacks configured."
-    SUMMARY_STACK_SUB_DEPENDENT="none configured"
-    return 0
-  fi
-
-  log_step "stacks: dependent group (${#DEPENDENT_STACKS[@]} configured)"
-  progress_child "Dependent stacks (${#DEPENDENT_STACKS[@]} in order)"
-
-  for stack_name in "${DEPENDENT_STACKS[@]}"; do
-    [[ -n "$stack_name" ]] || continue
-
-    redeploy_stack_by_name "$stack_name" "dependent" || {
-      log_warn "Failed redeploying dependent stack '${stack_name}'. Continuing."
-      continue
-    }
-
-    stack_post_redeploy_wait_for_group "$stack_name" dependent
-  done
-  quiet_stack_group_summary "$(_stack_group_display_name dependent)" "${STACK_GRP_DEPENDENT_CHECKED}" "${STACK_GRP_DEPENDENT_REDEPLOYED}" "${STACK_GRP_DEPENDENT_FAILED}"
-  SUMMARY_STACK_SUB_DEPENDENT="completed"
+  deploy_stack_group dependent DEPENDENT_STACKS
 }
 
 deploy_heavy_stacks() {
-  local stack_name _hid
-
-  if _quiet_tree_tty; then
-    printf '\n'
-    quiet_stack_subgroup_title "$(_stack_group_display_name heavy)"
-  fi
-  if [[ "${#HEAVY_STACKS[@]}" -eq 0 ]]; then
-    if _quiet_tree_tty; then
-      quiet_subnote_dim "(none configured)"
-    fi
-    log_detail "No heavy stacks configured."
-    SUMMARY_STACK_SUB_HEAVY="none configured"
-    return 0
-  fi
-
-  log_step "stacks: heavy group (${#HEAVY_STACKS[@]} configured)"
-  progress_child "Heavy stacks (${#HEAVY_STACKS[@]} in config order)"
-
-  for stack_name in "${HEAVY_STACKS[@]}"; do
-    [[ -n "$stack_name" ]] || continue
-
-    if array_contains "$stack_name" "${DEPENDENCY_STACKS[@]}" || array_contains "$stack_name" "${DEPENDENT_STACKS[@]}"; then
-      continue
-    fi
-
-    _hid="$(get_stack_id_by_name "$stack_name")"
-    if [[ -z "$_hid" ]]; then
-      log_detail "Heavy stack not on endpoint (skipping): ${stack_name}"
-      continue
-    fi
-
-    redeploy_stack_by_name "$stack_name" "heavy" || {
-      log_warn "Failed redeploying heavy stack '${stack_name}'. Continuing."
-      continue
-    }
-
-    stack_post_redeploy_wait_for_group "$stack_name" heavy
-  done
-  quiet_stack_group_summary "$(_stack_group_display_name heavy)" "${STACK_GRP_HEAVY_CHECKED}" "${STACK_GRP_HEAVY_REDEPLOYED}" "${STACK_GRP_HEAVY_FAILED}"
-  SUMMARY_STACK_SUB_HEAVY="completed"
+  deploy_stack_group heavy HEAVY_STACKS
 }
 
 deploy_remaining_non_heavy_stacks() {
@@ -3615,7 +3455,7 @@ deploy_remaining_non_heavy_stacks() {
     stack_post_redeploy_wait_for_group "$stack_name" remaining
 
   done < <(get_all_stack_names_for_endpoint)
-  quiet_stack_group_summary "$(_stack_group_display_name remaining)" "${STACK_GRP_REMAINING_CHECKED}" "${STACK_GRP_REMAINING_REDEPLOYED}" "${STACK_GRP_REMAINING_FAILED}"
+  quiet_stack_group_summary "$(_stack_group_display_name remaining)" "$(_stack_grp_get remaining checked)" "$(_stack_grp_get remaining redeployed)" "$(_stack_grp_get remaining failed)"
   SUMMARY_STACK_SUB_REMAINING="completed"
 }
 
@@ -3691,12 +3531,12 @@ portainer_docker_pull_image() {
   quiet_live "docker pull ${PORTAINER_IMAGE}…"
   tmp="$(_mktemp_track)"
   if docker pull "$PORTAINER_IMAGE" >>"$tmp" 2>&1; then
-    quiet_live_clear
+    quiet_live_clear_safe
     rm -f "$tmp"
     return 0
   fi
   ec=$?
-  quiet_live_clear
+  quiet_live_clear_safe
   RUN_WARNING_COUNT=$((RUN_WARNING_COUNT + 1))
   _emit_log_file_ts "Portainer docker pull failed (exit ${ec}); full output:"
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -3851,7 +3691,7 @@ wait_for_portainer_api() {
       progress_child "Wait for Portainer API (${waited}s / ${timeout}s)"
     fi
     if api_get "/api/status" >/dev/null 2>&1; then
-      quiet_live_clear
+      quiet_live_clear_safe
       log_step "Portainer API is available"
       return 0
     fi
@@ -3859,7 +3699,7 @@ wait_for_portainer_api() {
     waited=$((waited + 5))
   done
 
-  quiet_live_clear
+  quiet_live_clear_safe
   fail "Portainer API did not become available within ${timeout}s."
 }
 
@@ -4124,12 +3964,12 @@ run_tui_session_minimal() {
           ;;
         *Verbose*)
           OUTPUT_MODE="verbose"
-          VERBOSE="true"
+          _sync_output_mode
           break
           ;;
         *)
           OUTPUT_MODE="quiet"
-          VERBOSE="false"
+          _sync_output_mode
           break
           ;;
       esac
@@ -4146,12 +3986,12 @@ run_tui_session_minimal() {
           ;;
         2)
           OUTPUT_MODE="verbose"
-          VERBOSE="true"
+          _sync_output_mode
           break
           ;;
         *)
           OUTPUT_MODE="quiet"
-          VERBOSE="false"
+          _sync_output_mode
           break
           ;;
       esac
@@ -4175,44 +4015,73 @@ run_tui_session_minimal() {
   return 0
 }
 
+_tui_expert_flag_defs() {
+  printf '%s\n' \
+    'UPDATE_HOST_PACKAGES|Upgrade host packages?|true|Y/n' \
+    'UPDATE_DOCKER_PACKAGES|Upgrade Docker-related packages?|true|Y/n' \
+    'UPDATE_PORTAINER_CONTAINER|Recreate Portainer if image changed?|true|Y/n' \
+    'PRUNE_UNUSED_IMAGES|Prune unused images after stacks?|true|Y/n' \
+    'PRUNE_UNUSED_NETWORKS|Prune unused networks?|true|Y/n' \
+    'PRUNE_UNUSED_VOLUMES|Prune unused Docker volumes? (can delete data if a volume is unused)|false|y/N' \
+    'SKIP_HOST_IF_NONE|SKIP host apt if nothing to upgrade?|false|y/N' \
+    'SKIP_DOCKER_PKGS_IF_NONE|SKIP Docker pkgs if nothing?|false|y/N' \
+    'SKIP_STACK_PHASE_IF_CUP_CLEAN|SKIP stack phase if Cup reports 0 outdated?|false|y/N' \
+    'SKIP_CLEANUP_IF_STACKS_SKIPPED|SKIP cleanup when stacks skipped (Cup gate)?|true|Y/n' \
+    'STACK_UPDATE_PROMPT|Prompt before stack redeploys?|false|y/N' \
+    'SELECTIVE_STACK_REDEPLOY|Selective redeploy (digest/Cup)?|true|Y/n' \
+    'REDEPLOY_GIT_STACKS_IF_CUP_UNKNOWN|Redeploy git stacks when Cup unknown (selective)?|true|Y/n'
+}
+
+_tui_expert_apply_flags_gum() {
+  local entry var prompt default_yes
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    IFS='|' read -r var prompt default_yes _ <<<"$entry"
+    if _gum_choose_yes_no "$prompt" "$default_yes"; then
+      printf -v "$var" '%s' "true"
+    else
+      printf -v "$var" '%s' "false"
+    fi
+  done < <(_tui_expert_flag_defs)
+  local pol
+  _gum_choose_or_exit --header "Registry fail policy (selective, no Cup)" "safe (default)" "strict"
+  pol="$GUM_CHOOSE_RESULT"
+  case "$pol" in
+    *strict*) REGISTRY_FAIL_POLICY="strict" ;;
+    *) REGISTRY_FAIL_POLICY="safe" ;;
+  esac
+}
+
+_tui_expert_apply_flags_shell() {
+  local entry var prompt default_yes suffix yn
+  echo "Pipeline flags (y/N, Enter = keep current):"
+  while IFS= read -r entry; do
+    [[ -z "$entry" ]] && continue
+    IFS='|' read -r var prompt default_yes suffix <<<"$entry"
+    read -r -p "${prompt} [${suffix}]: " yn || true
+    case "${suffix}" in
+      Y/n)
+        case "${yn,,}" in n | no) printf -v "$var" '%s' "false" ;; *) printf -v "$var" '%s' "true" ;; esac
+        ;;
+      *)
+        case "${yn,,}" in y | yes) printf -v "$var" '%s' "true" ;; *) printf -v "$var" '%s' "false" ;; esac
+        ;;
+    esac
+  done < <(_tui_expert_flag_defs)
+  read -r -p "Registry policy strict (else safe)? [y/N]: " yn || true
+  case "${yn,,}" in y | yes) REGISTRY_FAIL_POLICY="strict" ;; *) REGISTRY_FAIL_POLICY="safe" ;; esac
+}
+
 run_tui_expert_pipeline_shell() {
   echo "Quiet tree: 1) always+emoji (default)  2) auto+check  3) never"
-  local c yn
+  local c
   read -r -p "Appearance [1-3]: " c || true
   case "${c:-1}" in
     2) STACK_UPDATER_COLOR="auto"; STACK_UPDATER_DONE_MARK="check" ;;
     3) STACK_UPDATER_COLOR="never"; STACK_UPDATER_DONE_MARK="check" ;;
     *) STACK_UPDATER_COLOR="always"; STACK_UPDATER_DONE_MARK="emoji" ;;
   esac
-  echo "Pipeline flags (y/N, Enter = keep current):"
-  read -r -p "Upgrade host packages? [Y/n]: " yn || true
-  case "${yn,,}" in n | no) UPDATE_HOST_PACKAGES="false" ;; esac
-  read -r -p "Upgrade Docker-related packages? [Y/n]: " yn || true
-  case "${yn,,}" in n | no) UPDATE_DOCKER_PACKAGES="false" ;; esac
-  read -r -p "Recreate Portainer if image changed? [Y/n]: " yn || true
-  case "${yn,,}" in n | no) UPDATE_PORTAINER_CONTAINER="false" ;; esac
-  read -r -p "Prune unused images after stacks? [Y/n]: " yn || true
-  case "${yn,,}" in n | no) PRUNE_UNUSED_IMAGES="false" ;; esac
-  read -r -p "Prune unused networks? [Y/n]: " yn || true
-  case "${yn,,}" in n | no) PRUNE_UNUSED_NETWORKS="false" ;; esac
-  read -r -p "Prune unused Docker volumes? [Y/n] (can delete data if a volume is unused): " yn || true
-  case "${yn,,}" in n | no) PRUNE_UNUSED_VOLUMES="false" ;; esac
-  read -r -p "SKIP host apt if nothing to upgrade? [y/N]: " yn || true
-  case "${yn,,}" in y | yes) SKIP_HOST_IF_NONE="true" ;; esac
-  read -r -p "SKIP Docker pkgs if nothing? [y/N]: " yn || true
-  case "${yn,,}" in y | yes) SKIP_DOCKER_PKGS_IF_NONE="true" ;; esac
-  read -r -p "SKIP stack phase if Cup reports 0 outdated? [y/N]: " yn || true
-  case "${yn,,}" in y | yes) SKIP_STACK_PHASE_IF_CUP_CLEAN="true" ;; esac
-  read -r -p "SKIP cleanup when stacks skipped (Cup gate)? [Y/n]: " yn || true
-  case "${yn,,}" in n | no) SKIP_CLEANUP_IF_STACKS_SKIPPED="false" ;; esac
-  read -r -p "Prompt before stack redeploys? [y/N]: " yn || true
-  case "${yn,,}" in y | yes) STACK_UPDATE_PROMPT="true" ;; esac
-  read -r -p "Selective redeploy (digest/Cup)? [Y/n]: " yn || true
-  case "${yn,,}" in n | no) SELECTIVE_STACK_REDEPLOY="false" ;; *) SELECTIVE_STACK_REDEPLOY="true" ;; esac
-  read -r -p "Redeploy git stacks when Cup unknown (selective)? [Y/n]: " yn || true
-  case "${yn,,}" in n | no) REDEPLOY_GIT_STACKS_IF_CUP_UNKNOWN="false" ;; esac
-  read -r -p "Registry policy strict (else safe)? [y/N]: " yn || true
-  case "${yn,,}" in y | yes) REGISTRY_FAIL_POLICY="strict" ;; *) REGISTRY_FAIL_POLICY="safe" ;; esac
+  _tui_expert_apply_flags_shell
 }
 
 run_tui_expert_gum() {
@@ -4254,7 +4123,7 @@ run_tui_expert_gum() {
       STACK_UPDATE_PROMPT="true"
       ;;
     *Expert*)
-      _run_tui_pipeline_expert_gum
+      _tui_expert_apply_flags_gum
       ;;
   esac
 }
@@ -4688,29 +4557,6 @@ _pick_action_menu_choice() {
   esac
 }
 
-_run_tui_pipeline_expert_gum() {
-  if _gum_choose_yes_no "Upgrade host packages?" true; then UPDATE_HOST_PACKAGES="true"; else UPDATE_HOST_PACKAGES="false"; fi
-  if _gum_choose_yes_no "Upgrade Docker-related packages?" true; then UPDATE_DOCKER_PACKAGES="true"; else UPDATE_DOCKER_PACKAGES="false"; fi
-  if _gum_choose_yes_no "Recreate Portainer container when image updates?" true; then UPDATE_PORTAINER_CONTAINER="true"; else UPDATE_PORTAINER_CONTAINER="false"; fi
-  if _gum_choose_yes_no "Prune unused images in cleanup?" true; then PRUNE_UNUSED_IMAGES="true"; else PRUNE_UNUSED_IMAGES="false"; fi
-  if _gum_choose_yes_no "Prune unused networks?" true; then PRUNE_UNUSED_NETWORKS="true"; else PRUNE_UNUSED_NETWORKS="false"; fi
-  if _gum_choose_yes_no "Prune unused Docker volumes? (unused only; can delete data if volumes become unused)" false; then PRUNE_UNUSED_VOLUMES="true"; else PRUNE_UNUSED_VOLUMES="false"; fi
-  if _gum_choose_yes_no "SKIP host apt when dry-run sim shows nothing?" false; then SKIP_HOST_IF_NONE="true"; else SKIP_HOST_IF_NONE="false"; fi
-  if _gum_choose_yes_no "SKIP Docker pkgs when sim shows nothing?" false; then SKIP_DOCKER_PKGS_IF_NONE="true"; else SKIP_DOCKER_PKGS_IF_NONE="false"; fi
-  if _gum_choose_yes_no "SKIP entire stacks phase when Cup reports 0 outdated?" false; then SKIP_STACK_PHASE_IF_CUP_CLEAN="true"; else SKIP_STACK_PHASE_IF_CUP_CLEAN="false"; fi
-  if _gum_choose_yes_no "SKIP cleanup when stacks phase skipped (Cup gate)?" true; then SKIP_CLEANUP_IF_STACKS_SKIPPED="true"; else SKIP_CLEANUP_IF_STACKS_SKIPPED="false"; fi
-  if _gum_choose_yes_no "Prompt before Portainer stack redeploys?" false; then STACK_UPDATE_PROMPT="true"; else STACK_UPDATE_PROMPT="false"; fi
-  if _gum_choose_yes_no "Selective stack redeploy (Cup / digest)?" true; then SELECTIVE_STACK_REDEPLOY="true"; else SELECTIVE_STACK_REDEPLOY="false"; fi
-  if _gum_choose_yes_no "Redeploy git stacks when Cup unknown (with selective)?" true; then REDEPLOY_GIT_STACKS_IF_CUP_UNKNOWN="true"; else REDEPLOY_GIT_STACKS_IF_CUP_UNKNOWN="false"; fi
-  local pol
-  _gum_choose_or_exit --header "Registry fail policy (selective, no Cup)" "safe (default)" "strict"
-  pol="$GUM_CHOOSE_RESULT"
-  case "$pol" in
-    *strict*) REGISTRY_FAIL_POLICY="strict" ;;
-    *) REGISTRY_FAIL_POLICY="safe" ;;
-  esac
-}
-
 run_tui_menu() {
   _tui_screen_reset
   run_tui_session_minimal
@@ -4850,9 +4696,59 @@ _count_redeploy_failed_in_notes() {
   printf '%s' "$n"
 }
 
-_phase_secs_fmt_or_dash() {
+_summary_phase_secs() {
   [[ -z "${1:-}" ]] && printf '%s' '—' && return
   _format_mm_ss "$1"
+}
+
+_run_summary_line() {
+  local msg="$1"
+  if _quiet_tree_tty; then
+    print_info 4 "$msg"
+  else
+    log_info "  $msg"
+  fi
+}
+
+_run_summary_section() {
+  if _quiet_tree_tty; then
+    printf '\n'
+    print_info 4 "$1"
+    printf '\n'
+  else
+    log_info ""
+    log_info "$1"
+  fi
+}
+
+_run_summary_result_line() {
+  local nf="$1" nr="$2"
+  if [[ "${nf:-0}" -gt 0 ]]; then
+    _run_summary_line "$(_leg_icon failed) Result: failure"
+  else
+    _run_summary_line "$(_leg_icon up_to_date) Result: success"
+  fi
+}
+
+_run_summary_stack_phase_line() {
+  local nf="$1" nr="$2"
+  if [[ "${SUMMARY_PHASE_STACKS}" == "completed" ]]; then
+    if [[ "${nf:-0}" -eq 0 ]] && [[ "${nr:-0}" -eq 0 ]]; then
+      if _quiet_tree_tty; then
+        _run_summary_line "$(_leg_icon no_change) Finished stack phase: no stacks redeployed."
+      elif [[ -n "${CUP_RUN_OUTDATED:-${LAST_CUP_OUTDATED:-}}" ]] && [[ "${CUP_RUN_OUTDATED:-$LAST_CUP_OUTDATED}" =~ ^[0-9]+$ ]] && [[ "${CUP_RUN_OUTDATED:-$LAST_CUP_OUTDATED}" -gt 0 ]]; then
+        log_info "$(_leg_icon no_change) Finished stack phase: no stacks redeployed. Cup reports ${CUP_RUN_OUTDATED:-$LAST_CUP_OUTDATED} image update(s) available; none required a Portainer stack touch for this run."
+      else
+        log_info "$(_leg_icon no_change) Finished stack phase: no stacks redeployed. No stack image updates were applied (selective / digest / Cup showed nothing to redeploy)."
+      fi
+    elif [[ "${nf:-0}" -eq 0 ]] && [[ "${nr:-0}" -gt 0 ]]; then
+      _run_summary_line "$(_leg_icon redeployed) Finished stack phase: ${nr} stack(s) redeployed."
+    else
+      _run_summary_line "$(_leg_icon failed) Finished stack phase: ${nr} redeployed, ${nf} failure(s)."
+    fi
+  elif [[ "${SUMMARY_PHASE_STACKS}" == "skipped_no_cup_updates" ]]; then
+    _run_summary_line "$(_leg_icon skipped) Stacks phase skipped (Cup reports no image updates)."
+  fi
 }
 
 # RUN SUMMARY container rows only: pre-run Cup snapshot (CUP_RUN_* / LAST_*). Never CUP_POST_*.
@@ -4883,7 +4779,7 @@ print_run_summary() {
   local _cup_tr _cup_ou _cup_cu _cup_un
   nf="$(_count_redeploy_failed_in_notes)"
   nr="${#STACKS_REDEPLOYED[@]}"
-  checked_sum=$((STACK_GRP_DEP_CHECKED + STACK_GRP_DEPENDENT_CHECKED + STACK_GRP_HEAVY_CHECKED + STACK_GRP_REMAINING_CHECKED))
+  checked_sum="$(_stack_grp_checked_sum)"
   unchanged_ct=0
   skipped_ct=0
   for s in "${STACKS_SKIPPED_REASONS[@]}"; do
@@ -4911,137 +4807,54 @@ print_run_summary() {
   if _quiet_tree_tty; then
     printf '\n'
     quiet_print_tree_banner_rule "RUN SUMMARY"
+  else
+    log_info ""
+    log_info "${_sum_banner}"
+  fi
 
-    if [[ "${nf:-0}" -gt 0 ]]; then
-      print_info 4 "$(_leg_icon failed) Result: failure"
-    elif [[ "${nr:-0}" -gt 0 ]]; then
-      print_info 4 "$(_leg_icon up_to_date) Result: success"
-    else
-      print_info 4 "$(_leg_icon up_to_date) Result: success"
-    fi
+  _run_summary_result_line "$nf" "$nr"
+  _run_summary_stack_phase_line "$nf" "$nr"
 
-    if [[ "${SUMMARY_PHASE_STACKS}" == "completed" ]]; then
-      if [[ "${nf:-0}" -eq 0 ]] && [[ "${nr:-0}" -eq 0 ]]; then
-        print_info 4 "$(_leg_icon no_change) Finished stack phase: no stacks redeployed."
-      elif [[ "${nf:-0}" -eq 0 ]] && [[ "${nr:-0}" -gt 0 ]]; then
-        print_info 4 "$(_leg_icon redeployed) Finished stack phase: ${nr} stack(s) redeployed."
-      else
-        print_info 4 "$(_leg_icon failed) Finished stack phase: ${nr} redeployed, ${nf} failure(s)."
-      fi
-    elif [[ "${SUMMARY_PHASE_STACKS}" == "skipped_no_cup_updates" ]]; then
-      print_info 4 "$(_leg_icon skipped) Stacks phase skipped (Cup reports no image updates)."
-    fi
+  _run_summary_section "Stack counts"
+  _run_summary_line "$(_leg_icon up_to_date) Checked:     ${checked_sum}"
+  _run_summary_line "$(_leg_icon redeployed) Redeployed:  ${nr}"
+  _run_summary_line "$(_leg_icon no_change) Unchanged:   ${unchanged_ct}"
+  _run_summary_line "$(_leg_icon skipped) Skipped:     ${skipped_ct}"
+  _run_summary_line "$(_leg_icon failed) Failed:      ${nf}"
 
-    printf '\n'
-    print_info 4 "Stack counts"
-    printf '\n'
-    print_info 4 "$(_leg_icon up_to_date) Checked:     ${checked_sum}"
-    print_info 4 "$(_leg_icon redeployed) Redeployed:  ${nr}"
-    print_info 4 "$(_leg_icon no_change) Unchanged:   ${unchanged_ct}"
-    print_info 4 "$(_leg_icon skipped) Skipped:     ${skipped_ct}"
-    print_info 4 "$(_leg_icon failed) Failed:      ${nf}"
+  _run_summary_section "Container counts"
+  _run_summary_line "$(_leg_icon no_change) Tracked:     ${_cup_tr}"
+  _run_summary_line "$(cup_update_icon) Updates available: ${_cup_ou}"
+  _run_summary_line "$(_leg_icon up_to_date) Up-to-date:  ${_cup_cu}"
+  _run_summary_line "❔ Unknown:     ${_cup_un}"
 
-    printf '\n'
-    print_info 4 "Container counts"
-    printf '\n'
-    print_info 4 "$(_leg_icon no_change) Tracked:     ${_cup_tr}"
-    print_info 4 "$(cup_update_icon) Updates available: ${_cup_ou}"
-    print_info 4 "$(_leg_icon up_to_date) Up-to-date:  ${_cup_cu}"
-    print_info 4 "❔ Unknown:     ${_cup_un}"
+  _run_summary_section "Warnings"
+  _run_summary_line "$(_leg_icon warnings) Warnings:    ${RUN_WARNING_COUNT:-0}"
 
-    printf '\n'
-    print_info 4 "Warnings"
-    printf '\n'
-    print_info 4 "$(_leg_icon warnings) Warnings:    ${RUN_WARNING_COUNT:-0}"
+  _run_summary_section "Phase timings"
+  _run_summary_line "host:          $(_summary_phase_secs "${PHASE_SEC_HOST:-}")"
+  _run_summary_line "docker_pkgs:   $(_summary_phase_secs "${PHASE_SEC_DOCKER_PKGS:-}")"
+  _run_summary_line "portainer:     $(_summary_phase_secs "${PHASE_SEC_PORTAINER:-}")"
+  _run_summary_line "stacks:        $(_summary_phase_secs "${PHASE_SEC_STACKS:-}")"
+  _run_summary_line "cleanup:       $(_summary_phase_secs "${PHASE_SEC_CLEANUP:-}")"
+  if [[ -n "${PIPELINE_START_EPOCH:-}" ]]; then
+    end_ts="$(date +%s)"
+    total_elapsed=$((end_ts - PIPELINE_START_EPOCH))
+    _run_summary_line "total:         $(_format_mm_ss "${total_elapsed}") ($(_format_duration_secs "${total_elapsed}"))"
+  else
+    _run_summary_line "total:         —"
+  fi
 
-    printf '\n'
-    print_info 4 "Phase timings"
-    printf '\n'
-    print_info 4 "host:          $(_phase_secs_fmt_or_dash "${PHASE_SEC_HOST:-}")"
-    print_info 4 "docker_pkgs:   $(_phase_secs_fmt_or_dash "${PHASE_SEC_DOCKER_PKGS:-}")"
-    print_info 4 "portainer:     $(_phase_secs_fmt_or_dash "${PHASE_SEC_PORTAINER:-}")"
-    print_info 4 "stacks:        $(_phase_secs_fmt_or_dash "${PHASE_SEC_STACKS:-}")"
-    print_info 4 "cleanup:       $(_phase_secs_fmt_or_dash "${PHASE_SEC_CLEANUP:-}")"
-    if [[ -n "${PIPELINE_START_EPOCH:-}" ]]; then
-      end_ts="$(date +%s)"
-      total_elapsed=$((end_ts - PIPELINE_START_EPOCH))
-      print_info 4 "total:         $(_format_mm_ss "${total_elapsed}") ($(format_duration "${total_elapsed}"))"
-    else
-      print_info 4 "total:         —"
-    fi
-
+  if _quiet_tree_tty; then
     printf '\n'
     print_info 4 "Log saved to:"
     print_info 4 "${LOG_FILE}"
-
     printf '\n'
     print_info 4 "Exit code: ${LAST_PIPELINE_EXIT_CODE}"
   else
     log_info ""
-    log_info "${_sum_banner}"
-
-    if [[ "${nf:-0}" -gt 0 ]]; then
-      log_info "$(_leg_icon failed) Result: failure"
-    elif [[ "${nr:-0}" -gt 0 ]]; then
-      log_info "$(_leg_icon up_to_date) Result: success"
-    else
-      log_info "$(_leg_icon up_to_date) Result: success"
-    fi
-
-    if [[ "${SUMMARY_PHASE_STACKS}" == "completed" ]]; then
-      if [[ "${nf:-0}" -eq 0 ]] && [[ "${nr:-0}" -eq 0 ]]; then
-        if [[ -n "${CUP_RUN_OUTDATED:-${LAST_CUP_OUTDATED:-}}" ]] && [[ "${CUP_RUN_OUTDATED:-$LAST_CUP_OUTDATED}" =~ ^[0-9]+$ ]] && [[ "${CUP_RUN_OUTDATED:-$LAST_CUP_OUTDATED}" -gt 0 ]]; then
-          log_info "$(_leg_icon no_change) Finished stack phase: no stacks redeployed. Cup reports ${CUP_RUN_OUTDATED:-$LAST_CUP_OUTDATED} image update(s) available; none required a Portainer stack touch for this run."
-        else
-          log_info "$(_leg_icon no_change) Finished stack phase: no stacks redeployed. No stack image updates were applied (selective / digest / Cup showed nothing to redeploy)."
-        fi
-      elif [[ "${nf:-0}" -eq 0 ]] && [[ "${nr:-0}" -gt 0 ]]; then
-        log_info "$(_leg_icon redeployed) Finished stack phase: ${nr} stack(s) redeployed."
-      else
-        log_info "$(_leg_icon failed) Finished stack phase: ${nr} redeployed, ${nf} failure(s)."
-      fi
-    elif [[ "${SUMMARY_PHASE_STACKS}" == "skipped_no_cup_updates" ]]; then
-      log_info "$(_leg_icon skipped) Stacks phase skipped (Cup reports no image updates)."
-    fi
-
-    log_info ""
-    log_info "Stack counts"
-    log_info "  $(_leg_icon up_to_date) Checked:     ${checked_sum}"
-    log_info "  $(_leg_icon redeployed) Redeployed:  ${nr}"
-    log_info "  $(_leg_icon no_change) Unchanged:   ${unchanged_ct}"
-    log_info "  $(_leg_icon skipped) Skipped:     ${skipped_ct}"
-    log_info "  $(_leg_icon failed) Failed:      ${nf}"
-
-    log_info ""
-    log_info "Container counts"
-    log_info "  $(_leg_icon no_change) Tracked:     ${_cup_tr}"
-    log_info "  $(cup_update_icon) Updates available: ${_cup_ou}"
-    log_info "  $(_leg_icon up_to_date) Up-to-date:  ${_cup_cu}"
-    log_info "  ❔ Unknown:     ${_cup_un}"
-
-    log_info ""
-    log_info "Warnings"
-    log_info "  $(_leg_icon warnings) Warnings:    ${RUN_WARNING_COUNT:-0}"
-
-    log_info ""
-    log_info "Phase timings"
-    log_info "  host:          $(_phase_secs_fmt_or_dash "${PHASE_SEC_HOST:-}")"
-    log_info "  docker_pkgs:   $(_phase_secs_fmt_or_dash "${PHASE_SEC_DOCKER_PKGS:-}")"
-    log_info "  portainer:     $(_phase_secs_fmt_or_dash "${PHASE_SEC_PORTAINER:-}")"
-    log_info "  stacks:        $(_phase_secs_fmt_or_dash "${PHASE_SEC_STACKS:-}")"
-    log_info "  cleanup:       $(_phase_secs_fmt_or_dash "${PHASE_SEC_CLEANUP:-}")"
-    if [[ -n "${PIPELINE_START_EPOCH:-}" ]]; then
-      end_ts="$(date +%s)"
-      total_elapsed=$((end_ts - PIPELINE_START_EPOCH))
-      log_info "  total:         $(_format_mm_ss "${total_elapsed}") ($(format_duration "${total_elapsed}"))"
-    else
-      log_info "  total:         —"
-    fi
-
-    log_info ""
     log_info "Log saved to:"
     log_info "  ${LOG_FILE}"
-
     log_info ""
     log_info "Exit code: ${LAST_PIPELINE_EXIT_CODE}"
   fi
@@ -5080,7 +4893,7 @@ print_run_summary() {
 run_phases_list() {
   local phases_raw="$1"
   local -a phases=()
-  local ph _t
+  local ph
   while IFS= read -r line; do
     [[ -n "$line" ]] && phases+=("$line")
   done <<<"$phases_raw"
@@ -5089,7 +4902,7 @@ run_phases_list() {
 
   acquire_run_lock
   rotate_log_if_needed
-  reset_phases_list_summaries
+  reset_full_pipeline_summaries
   quiet_live_clear_safe
   PIPELINE_START_EPOCH="$(date +%s)"
   quiet_print_title_banner
@@ -5103,81 +4916,7 @@ run_phases_list() {
   print_pipeline_statistics "pipeline_start"
 
   for ph in "${phases[@]}"; do
-    case "$ph" in
-      host)
-        quiet_ensure_section green "System"
-        confirm_step "Proceed with phase: host packages?"
-        log_step "phase: host"
-        _t="$(date +%s)"
-        update_host_packages
-        PHASE_SEC_HOST=$(($(date +%s) - _t))
-        quiet_item_line 2 "Host packages"
-        ;;
-      docker_pkgs)
-        quiet_ensure_section green "System"
-        confirm_step "Proceed with phase: Docker apt packages?"
-        log_step "phase: docker_pkgs"
-        _t="$(date +%s)"
-        update_docker_packages
-        PHASE_SEC_DOCKER_PKGS=$(($(date +%s) - _t))
-        quiet_item_line 2 "Docker-related apt packages"
-        ;;
-      portainer)
-        portainer_quiet_ui_open
-        portainer_log_digest_diagnostics_verbose
-        confirm_step "Proceed with phase: Portainer container?"
-        log_step "phase: portainer"
-        _t="$(date +%s)"
-        update_portainer_container_if_enabled
-        PHASE_SEC_PORTAINER=$(($(date +%s) - _t))
-        portainer_quiet_ui_container_outcome
-        log_step "preflight: re-check Portainer API after Portainer phase"
-        portainer_quiet_ui_api_validate_and_refresh_cache "no_catalog_live"
-        _emit_log_file_ts "[pipeline] portainer phase complete"
-        ;;
-      cup)
-        quiet_ensure_section green "System"
-        confirm_step "Proceed with phase: Cup API diagnostics?"
-        log_step "phase: cup"
-        cup_run_selftest_phase || true
-        ;;
-      stacks)
-        _emit_log_file_ts "[pipeline] update strategy printing"
-        quiet_print_update_strategy_block
-        _emit_log_file_ts "[pipeline] update strategy complete"
-        confirm_step "Proceed with phase: redeploy all stacks?"
-        log_step "phase: stacks"
-        _t="$(date +%s)"
-        run_stacks_phase_with_cup_gate
-        PHASE_SEC_STACKS=$(($(date +%s) - _t))
-        if [[ "$STACK_PHASE_SKIPPED_DUE_CUP" != "true" ]] && [[ "${SUMMARY_PHASE_STACKS}" == "completed" ]]; then
-          quiet_print_stack_subgroup_metrics_block || true
-        fi
-        if _quiet_tree_tty; then
-          QUIET_STACK_SECTION_DONE="true"
-        fi
-        _emit_log_file_ts "[pipeline] stacks phase complete"
-        cup_refresh_after_stacks_if_configured || true
-        ;;
-      cleanup)
-        if _quiet_tree_tty && [[ "${QUIET_STACK_SECTION_DONE:-false}" == "true" ]]; then
-          printf '\n'
-          QUIET_STACK_SECTION_DONE="false"
-        fi
-        quiet_print_tree_banner_rule "CLEANUP"
-        confirm_step "Proceed with phase: Docker prune?"
-        log_step "phase: cleanup"
-        _emit_log_file_ts "[pipeline] cleanup phase starting"
-        _t="$(date +%s)"
-        cleanup_docker
-        PHASE_SEC_CLEANUP=$(($(date +%s) - _t))
-        _emit_log_file_ts "[pipeline] cleanup phase complete"
-        quiet_print_cleanup_summary || true
-        ;;
-      *)
-        fail "Unknown phase: $ph"
-        ;;
-    esac
+    _run_pipeline_phase "$ph" || true
   done
 
   log_step "phase run complete"
@@ -5187,6 +4926,85 @@ run_phases_list() {
   print_run_summary || true
   _emit_log_file_ts "[pipeline] run summary complete"
   _emit_log_file_ts "[pipeline] full pipeline complete"
+}
+
+_run_pipeline_phase() {
+  local ph="$1" _t
+  case "$ph" in
+    host)
+      quiet_ensure_section green "System"
+      confirm_step "Proceed with phase: host packages?"
+      log_step "phase: host"
+      _t="$(date +%s)"
+      update_host_packages
+      PHASE_SEC_HOST=$(($(date +%s) - _t))
+      quiet_item_line 2 "Host packages"
+      ;;
+    docker_pkgs)
+      quiet_ensure_section green "System"
+      confirm_step "Proceed with phase: Docker apt packages?"
+      log_step "phase: docker_pkgs"
+      _t="$(date +%s)"
+      update_docker_packages
+      PHASE_SEC_DOCKER_PKGS=$(($(date +%s) - _t))
+      quiet_item_line 2 "Docker-related apt packages"
+      ;;
+    portainer)
+      portainer_quiet_ui_open
+      portainer_log_digest_diagnostics_verbose
+      confirm_step "Proceed with phase: Portainer container?"
+      log_step "phase: portainer"
+      _t="$(date +%s)"
+      update_portainer_container_if_enabled
+      PHASE_SEC_PORTAINER=$(($(date +%s) - _t))
+      portainer_quiet_ui_container_outcome
+      log_step "preflight: re-check Portainer API after Portainer phase"
+      portainer_quiet_ui_api_validate_and_refresh_cache "no_catalog_live"
+      _emit_log_file_ts "[pipeline] portainer phase complete"
+      ;;
+    cup)
+      quiet_ensure_section green "System"
+      confirm_step "Proceed with phase: Cup API diagnostics?"
+      log_step "phase: cup"
+      cup_run_selftest_phase || true
+      ;;
+    stacks)
+      _emit_log_file_ts "[pipeline] update strategy printing"
+      quiet_print_update_strategy_block
+      _emit_log_file_ts "[pipeline] update strategy complete"
+      confirm_step "Proceed with phase: redeploy all stacks?"
+      log_step "phase: stacks"
+      _t="$(date +%s)"
+      run_stacks_phase_with_cup_gate
+      PHASE_SEC_STACKS=$(($(date +%s) - _t))
+      if [[ "$STACK_PHASE_SKIPPED_DUE_CUP" != "true" ]] && [[ "${SUMMARY_PHASE_STACKS}" == "completed" ]]; then
+        quiet_print_stack_subgroup_metrics_block || true
+      fi
+      if _quiet_tree_tty; then
+        QUIET_STACK_SECTION_DONE="true"
+      fi
+      _emit_log_file_ts "[pipeline] stacks phase complete"
+      cup_refresh_after_stacks_if_configured || true
+      ;;
+    cleanup)
+      if _quiet_tree_tty && [[ "${QUIET_STACK_SECTION_DONE:-false}" == "true" ]]; then
+        printf '\n'
+        QUIET_STACK_SECTION_DONE="false"
+      fi
+      quiet_print_tree_banner_rule "CLEANUP"
+      confirm_step "Proceed with phase: Docker prune?"
+      log_step "phase: cleanup"
+      _emit_log_file_ts "[pipeline] cleanup phase starting"
+      _t="$(date +%s)"
+      cleanup_docker
+      PHASE_SEC_CLEANUP=$(($(date +%s) - _t))
+      _emit_log_file_ts "[pipeline] cleanup phase complete"
+      quiet_print_cleanup_summary || true
+      ;;
+    *)
+      fail "Unknown phase: $ph"
+      ;;
+  esac
 }
 
 execute_full_pipeline() {

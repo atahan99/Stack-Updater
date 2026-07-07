@@ -2,7 +2,13 @@
 # Pure helpers for stack-updater (sourced by stack-updater.sh; also tested via bats).
 
 normalize_image_ref_token() {
-  echo "${1,,}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e 's/#.*$//'
+  local s="${1,,}"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%%[[:space:]]*}"
+  s="${s#\"}"
+  s="${s%\"}"
+  s="${s%%#*}"
+  printf '%s' "$s"
 }
 
 compose_image_lines_from_content() {
@@ -49,6 +55,71 @@ _cup_image_refs_equivalent() {
   return 1
 }
 
+# Shared jq predicate for Cup outdated entries (images + containers).
+_cup_jq_is_outdated() {
+  printf '%s' '((.result // empty | type == "object") and .result.has_update == true) or (.update_available == true)'
+}
+
+cup_outdated_image_lines_from_json() {
+  local json="${1:-}" filter
+  [[ -z "$json" ]] && return 0
+  filter="$(_cup_jq_is_outdated)"
+  echo "$json" | jq -r "
+    (
+      [ .images[]?
+        | select(${filter})
+        | (.reference // .image // .name // empty) | strings ]
+      + [ .containers[]?
+        | select(${filter})
+        | (.image // .name // .reference // empty) | strings ]
+    ) | .[] | select(length > 0)
+  " 2>/dev/null | sort -u | sed '/^$/d' || true
+}
+
+_compose_images_match_cup_ref() {
+  local compose_content="$1" cup_ref="$2"
+  local img
+  [[ -z "$cup_ref" ]] && return 1
+  while IFS= read -r img; do
+    [[ -z "$img" ]] && continue
+    _cup_image_refs_equivalent "$img" "$cup_ref" && return 0
+  done <<<"$(compose_image_lines_from_content "$compose_content")"
+  return 1
+}
+
+# Sets SELECTIVE_CUP_MATCH_REF on match when called from selective redeploy path.
+compose_images_match_cup_outdated() {
+  local compose_content="$1" cup_json="$2"
+  local outdated cup_ln
+  SELECTIVE_CUP_MATCH_REF=""
+  outdated="$(cup_outdated_image_lines_from_json "$cup_json")"
+  [[ -z "$outdated" ]] && return 1
+  while IFS= read -r cup_ln; do
+    [[ -z "$cup_ln" ]] && continue
+    if _compose_images_match_cup_ref "$compose_content" "$cup_ln"; then
+      SELECTIVE_CUP_MATCH_REF="$cup_ln"
+      return 0
+    fi
+  done <<<"$outdated"
+  return 1
+}
+
+registry_digest_for_image_ref() {
+  local manifest
+  manifest="$(docker manifest inspect "$1" 2>/dev/null)" || return 0
+  registry_digest_from_manifest_json "$manifest"
+}
+
+local_digest_for_image_ref() {
+  local rd
+  rd="$(docker image inspect --format '{{index .RepoDigests 0}}' "$1" 2>/dev/null || true)"
+  if [[ -n "$rd" && "$rd" == *@* ]]; then
+    printf '%s' "${rd#*@}"
+    return 0
+  fi
+  printf '%s' ""
+}
+
 portainer_normalize_version_sortkey() {
   local s="${1:-}"
   s="${s#"${s%%[![:space:]]*}"}"
@@ -57,6 +128,11 @@ portainer_normalize_version_sortkey() {
   s="${s#V}"
   s="${s#"${s%%[![:digit:].]*}"}"
   printf '%s' "$s"
+}
+
+_format_mm_ss() {
+  local secs="${1:-0}"
+  printf '%02d:%02d' $((secs / 60)) $((secs % 60))
 }
 
 _format_duration_secs() {
@@ -68,6 +144,15 @@ _format_duration_secs() {
   else
     printf '%ds' "$s"
   fi
+}
+
+# Post-redeploy sleep seconds (dependency group uses container poll + DEPENDENCY_SETTLE_SECONDS separately).
+stack_wait_seconds_for_group() {
+  case "${1:-}" in
+    dependent) printf '%s' "${DEPENDENT_STACK_SLEEP_SECONDS:-30}" ;;
+    heavy) printf '%s' "${HEAVY_STACK_SLEEP_SECONDS:-45}" ;;
+    remaining | *) printf '%s' "${DEFAULT_STACK_SLEEP_SECONDS:-10}" ;;
+  esac
 }
 
 # Compose v2 project slug from Portainer stack name (lowercase, non-alnum -> hyphen).
