@@ -228,6 +228,8 @@ CUP_POST_OUTDATED=""
 CUP_POST_CURRENT=""
 CUP_POST_UNKNOWN=""
 CUP_POST_REFRESH_JSON=""
+# Last parseable JSON from cup_poll_json_until_metrics_ready (reuse; mid-scan refetch can be empty).
+CUP_POLL_LAST_JSON=""
 # Last HTTP code from cup_http_refresh_once (logging).
 CUP_HTTP_REFRESH_LAST_CODE=""
 # Set when quiet stack rows / subgroup block finished; blank line before CLEANUP banner.
@@ -274,6 +276,7 @@ reset_full_pipeline_summaries() {
   CUP_POST_CURRENT=""
   CUP_POST_UNKNOWN=""
   CUP_POST_REFRESH_JSON=""
+  CUP_POLL_LAST_JSON=""
   CUP_HTTP_REFRESH_LAST_CODE=""
   QUIET_STACK_SECTION_DONE="false"
   CLEANUP_IMAGE_SUMMARY=""
@@ -2412,14 +2415,17 @@ cup_http_refresh_once() {
 }
 
 # After refresh, poll GET /api/v3/json until cup_compute_counts succeeds or timeout (same seconds as CUP_REFRESH_TIMEOUT_SECONDS).
+# On success sets CUP_POLL_LAST_JSON — callers must reuse it; a mid-scan refetch can return unparseable JSON.
 cup_poll_json_until_metrics_ready() {
   local label="${1:-poll}" sec0 now elapsed tracked _o _c _u json
+  CUP_POLL_LAST_JSON=""
   sec0="$(date +%s 2>/dev/null || echo 0)"
   while true; do
     json="$(cup_fetch_json_document 2>/dev/null)" || json=""
     if [[ -n "$json" ]]; then
       read -r tracked _o _c _u <<<"$(cup_compute_counts_from_json "$json")"
       if [[ "$tracked" != "-1" ]]; then
+        CUP_POLL_LAST_JSON="$json"
         log_verbose "Cup (${label}): JSON metrics ready (tracked=${tracked})."
         _emit_log_file_ts "Cup (${label}): JSON metrics ready (HTTP GET /api/v3/json, tracked=${tracked})."
         return 0
@@ -2460,7 +2466,10 @@ cup_refresh_after_stacks_if_configured() {
   if cup_http_refresh_once; then
     _emit_log_file_ts "Cup (post-stack): /api/v3/refresh HTTP ${CUP_HTTP_REFRESH_LAST_CODE}; polling /api/v3/json"
     cup_poll_json_until_metrics_ready "post-stack" || true
-    json="$(cup_fetch_json_document 2>/dev/null)" || json=""
+    json="${CUP_POLL_LAST_JSON:-}"
+    if [[ -z "$json" ]]; then
+      json="$(cup_fetch_json_document 2>/dev/null)" || json=""
+    fi
     if [[ -n "$json" ]]; then
       read -r t o c u <<<"$(cup_compute_counts_from_json "$json")"
       if [[ "$t" != "-1" ]]; then
@@ -2520,6 +2529,11 @@ cup_fetch_json() {
   if [[ "${CUP_ENABLED:-false}" == "true" ]] && [[ "${CUP_REFRESH_DONE:-false}" != "true" ]]; then
     cup_refresh_if_enabled
     CUP_REFRESH_DONE="true"
+    # Reuse polled body — immediate refetch during Cup scan often returns unparseable JSON.
+    if [[ -n "${CUP_POLL_LAST_JSON:-}" ]]; then
+      printf '%s' "$CUP_POLL_LAST_JSON"
+      return 0
+    fi
   fi
   cup_fetch_json_document
 }
