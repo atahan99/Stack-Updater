@@ -64,6 +64,14 @@ setup() {
   [[ "$output" != *"redis:7"* ]]
 }
 
+@test "cup_outdated_detail_lines_from_json includes version arrow" {
+  local json='{"images":[{"reference":"nginx:alpine","result":{"has_update":true,"info":{"current_version":"1.25","new_version":"1.27","version_update_type":"minor"}}},{"reference":"redis:7","result":{"has_update":false}}]}'
+  run cup_outdated_detail_lines_from_json "$json"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"outdated: nginx:alpine 1.25 → 1.27 minor"* ]]
+  [[ "$output" != *"redis:7"* ]]
+}
+
 @test "compose_images_match_cup_outdated matches compose image" {
   local compose='services:\n  web:\n    image: nginx:alpine\n'
   local json='{"images":[{"reference":"docker.io/library/nginx:alpine","result":{"has_update":true}}]}'

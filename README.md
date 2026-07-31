@@ -274,6 +274,7 @@ CUP_ENABLED="true"
 CUP_URL="http://127.0.0.1:8000"
 CUP_REFRESH_BEFORE_CHECK="true"
 CUP_REFRESH_TIMEOUT_SECONDS="60"
+CUP_REFRESH_AFTER_STACKS="true"
 PORTAINER_USE_CUP_PRECHECK="true"
 ```
 
@@ -283,6 +284,7 @@ The script uses Cup to:
 - Detect available updates.
 - Match outdated images to Portainer stacks.
 - Skip unnecessary Portainer image pulls when Cup says Portainer is current.
+- Refresh again after the stacks phase and show before/after counts in the run summary when `CUP_REFRESH_AFTER_STACKS=true`.
 
 Check Cup manually:
 

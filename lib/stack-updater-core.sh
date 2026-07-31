@@ -76,6 +76,35 @@ cup_outdated_image_lines_from_json() {
   " 2>/dev/null | sort -u | sed '/^$/d' || true
 }
 
+# Verbose-friendly outdated rows (ref + versions); max 40 unique refs.
+# Parenthesize image/container generators — bare comma binds tighter than intended with |.
+cup_outdated_detail_lines_from_json() {
+  local json="${1:-}" filter
+  [[ -z "$json" ]] && return 0
+  filter="$(_cup_jq_is_outdated)"
+  echo "$json" | jq -r "
+    (
+      [ ((.images // [])[]? | select(${filter}) | {
+          r: (.reference // .image // .name // \"\"),
+          c: (.result.info.current_version // .result.info.current_tag // \"\"),
+          n: (.result.info.new_version // .result.info.new_tag // \"\"),
+          t: (.result.info.version_update_type // .result.info.type // \"\")
+        }) ]
+      + [ ((.containers // [])[]? | select(${filter}) | {
+          r: (.image // .name // .reference // \"\"),
+          c: (.result.info.current_version // .result.info.current_tag // \"\"),
+          n: (.result.info.new_version // .result.info.new_tag // \"\"),
+          t: (.result.info.version_update_type // .result.info.type // \"\")
+        }) ]
+    )
+    | map(select((.r | type == \"string\") and (.r | length) > 0))
+    | group_by(.r)
+    | map(.[0])
+    | .[0:40][]
+    | \"outdated: \\(.r) \\(.c) → \\(.n) \\(.t)\"
+  " 2>/dev/null || true
+}
+
 _compose_images_match_cup_ref() {
   local compose_content="$1" cup_ref="$2"
   local img
