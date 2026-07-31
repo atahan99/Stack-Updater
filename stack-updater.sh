@@ -2527,9 +2527,10 @@ cup_fetch_json() {
   local base="${CUP_URL%/}"
   [[ -z "$base" ]] && return 1
   if [[ "${CUP_ENABLED:-false}" == "true" ]] && [[ "${CUP_REFRESH_DONE:-false}" != "true" ]]; then
-    cup_refresh_if_enabled
+    # Logs must not hit stdout — callers capture this function into json="$(cup_fetch_json)".
+    cup_refresh_if_enabled >&2
     CUP_REFRESH_DONE="true"
-    # Reuse polled body — immediate refetch during Cup scan often returns unparseable JSON.
+    # Reuse polled body — immediate refetch during Cup scan can return unparseable JSON.
     if [[ -n "${CUP_POLL_LAST_JSON:-}" ]]; then
       printf '%s' "$CUP_POLL_LAST_JSON"
       return 0
